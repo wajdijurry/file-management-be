@@ -1,0 +1,20 @@
+{
+  "name": "file-management-backend",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "dependencies": {
+    "@sencha/ext-gen": "*",
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "express": "^4.17.1",
+    "mime": "^2",
+    "mongoose": "^5.10.9",
+    "multer": "^1.4.2",
+    "unzipper": "^0.12.3",
+    "bcrypt": "^5.1.1",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
