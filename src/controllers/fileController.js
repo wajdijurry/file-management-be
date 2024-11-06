@@ -151,3 +151,13 @@ exports.decompressFile = async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 };
+
+// Function to delete a single file
+exports.renameItem = async (req, res) => {
+    try {
+        await FileService.renameItem(req.userId, req.params.newName);
+        res.json({ success: true, message: 'File/Folder renamed successfully.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Failed to rename file/folder.' });
+    }
+};

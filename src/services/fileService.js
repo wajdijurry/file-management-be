@@ -484,6 +484,70 @@ class FileService {
             console.log('No new files to insert.');
         }
     }
+
+    static async renameItem(itemId, newName, isFolder) {
+        if (!itemId || !newName) {
+            throw new Error('itemId and newName are required');
+        }
+
+        let item, oldPath, newPath;
+
+        if (isFolder) {
+            // Find the folder by ID
+            item = await Folder.findById(itemId);
+            if (!item) throw new Error('Folder not found');
+
+            // Set old and new paths for renaming
+            oldPath = path.join(__dirname, '../../public/uploads', item.path);
+            newPath = path.join(path.dirname(oldPath), newName);
+
+            // Rename folder in the filesystem
+            await fs.rename(oldPath, newPath);
+
+            // Update the folder's own path in the database
+            const newDbPath = path.join(path.dirname(item.path), newName);
+            item.name = newName;
+            item.path = newDbPath;
+            await item.save();
+
+            // Find all child files and folders with paths starting with the old path
+            const childFiles = await File.find({ path: new RegExp(`^${item.path}/`) });
+            const childFolders = await Folder.find({ path: new RegExp(`^${item.path}/`) });
+
+            // Update each child item to reflect the new path
+            const updatePromises = [
+                ...childFiles.map(file => {
+                    file.path = file.path.replace(item.path, newDbPath);
+                    return file.save();
+                }),
+                ...childFolders.map(folder => {
+                    folder.path = folder.path.replace(item.path, newDbPath);
+                    return folder.save();
+                })
+            ];
+
+            await Promise.all(updatePromises);
+
+        } else {
+            // Find the file by ID
+            item = await File.findById(itemId);
+            if (!item) throw new Error('File not found');
+
+            // Set old and new paths for renaming
+            oldPath = path.join(__dirname, '../../public/uploads', item.path);
+            newPath = path.join(path.dirname(oldPath), newName);
+
+            // Rename file in the filesystem
+            await fs.rename(oldPath, newPath);
+
+            // Update the file's name and path in the database
+            item.name = newName;
+            item.path = path.join(path.dirname(item.path), newName);
+            await item.save();
+        }
+
+        return `${isFolder ? 'Folder' : 'File'} renamed successfully`;
+    }
 }
 
 module.exports = FileService;
