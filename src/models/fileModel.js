@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const fileSchema = new mongoose.Schema({
     name: {type: String, required: true},
     path: {type: String, required: true},
+    parent_id: {type: String, default: null },
     size: {type: Number, required: true},
     mimetype: {type: String, required: true},
     createdAt: {type: Date, default: Date.now},

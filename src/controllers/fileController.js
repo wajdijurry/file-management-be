@@ -104,19 +104,20 @@ exports.deleteMultipleFiles = async (req, res) => {
             return res.status(404).json({ success: false, message: 'No files found for the provided IDs.' });
         }
     } catch (error) {
+        console.log(error);
         res.status(500).json({ success: false, message: 'An error occurred while deleting files.' });
     }
 };
 
 exports.createFolder = async (req, res) => {
-    const { name } = req.body;
+    const { name, parentId } = req.body;
 
     if (!name) {
         return res.status(400).json({ error: 'Folder name is required' });
     }
 
     try {
-        await FileService.createFolder(req.userId, name);
+        await FileService.createFolder(req.userId, name, parentId);
         res.status(201).json({ message: 'Folder created successfully' });
     } catch (error) {
         console.error('Error creating folder:', error);
@@ -137,14 +138,14 @@ exports.compressFiles = async (req, res) => {
 
 exports.decompressFile = async (req, res) => {
     try {
-        const { filePath, targetFolder } = req.body;
+        const { filePath, targetFolder, merge } = req.body;
 
         if (!filePath || !targetFolder) {
             return res.status(400).json({ error: 'filePath and targetFolder are required' });
         }
 
         console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, targetFolder);
+        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge);
         res.status(200).json(result);
     } catch (error) {
         console.error('Error decompressing file:', error);
@@ -155,9 +156,10 @@ exports.decompressFile = async (req, res) => {
 // Function to delete a single file
 exports.renameItem = async (req, res) => {
     try {
-        await FileService.renameItem(req.userId, req.params.newName);
+        await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder);
         res.json({ success: true, message: 'File/Folder renamed successfully.' });
     } catch (err) {
+        console.log(err);
         res.status(500).json({ success: false, message: 'Failed to rename file/folder.' });
     }
 };

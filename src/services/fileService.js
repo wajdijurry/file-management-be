@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const mime = require('mime');
 const archiver = require('archiver');
-const unzipper = require('unzipper');
+const extract = require('extract-zip');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -29,7 +29,7 @@ class FileService {
             // Save file metadata to the database
             const fileRecord = new File({
                 name: file.originalname,
-                path: filePath, // Store relative path in DB
+                path: path.join(userId, folder, file.originalname), // Store relative path in DB
                 size: file.size,
                 mimetype: file.mimetype,
                 createdAt: new Date(),
@@ -71,7 +71,6 @@ class FileService {
         const targetPath = folderName ? path.join(uploadDirectory, folderName) : uploadDirectory;
 
         if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
-            console.log(targetPath);
             throw new Error(`The folder "${folderName}" does not exist.`);
         }
 
@@ -82,9 +81,10 @@ class FileService {
         const folderRecords = await Folder.find({
             userId: userId,
             name: { $in: items },
-            path: folderName
-                ? new RegExp(`^${folderName}/[^/]+$`) // Match folders directly under the specified folderName
-                : new RegExp('\s+') // Match only top-level folders when folderName is empty (root directory)
+            deleted: false,
+            // path: folderName
+            //     ? new RegExp(`^${folderName}/[^/]+$`) // Match folders directly under the specified folderName
+            //     : new RegExp('\s+') // Match only top-level folders when folderName is empty (root directory)
         }).exec();
 
         // Find files in the specified directory
@@ -93,8 +93,6 @@ class FileService {
             name: { $in: items },
             deleted: false
         }).exec();
-
-        console.log(fileRecords);
 
         // Create lookup maps for quick reference
         const folderDataMap = folderRecords.reduce((acc, folder) => {
@@ -162,7 +160,7 @@ class FileService {
             throw new Error('File not found');
         }
 
-        let filePath = file.path;
+        let filePath = path.join(this.uploadDirectory, file.path);
 
         if (!fs.existsSync(filePath)) {
             console.error(`File does not exist on disk: ${filePath}`);
@@ -186,89 +184,116 @@ class FileService {
     }
 
     static async deleteMultipleFiles(userId, ids) {
-        // Find all files and folders marked for deletion
+        // Find files and folders to be deleted
         const files = await File.find({ _id: { $in: ids }, userId: userId, deleted: false });
         const folders = await Folder.find({ _id: { $in: ids }, userId: userId, deleted: false });
 
-        // Prepare paths for file and folder deletion from the filesystem
-        const filePaths = files.map(file => path.join(this.uploadDirectory, userId, file.path));
-        const folderPaths = folders.map(folder => path.join(this.uploadDirectory, userId, folder.path));
+        const deletionResults = {
+            filesDeleted: 0,
+            foldersDeleted: 0
+        };
 
-        // Helper function to recursively delete folder contents
-        const deleteFolderContents = async (folderPath) => {
-            // Find all nested files and folders under the current folder path
-            const nestedFiles = await File.find({ userId: userId, path: new RegExp(`^${folderPath}/`), deleted: false });
-            const nestedFolders = await Folder.find({ userId: userId, path: new RegExp(`^${folderPath}/`), deleted: false });
-
-            // Collect file and folder paths for deletion from filesystem
-            const nestedFilePaths = nestedFiles.map(file => path.join(this.uploadDirectory, userId, file.path));
-            const nestedFolderPaths = nestedFolders.map(folder => path.join(this.uploadDirectory, userId, folder.path));
-
-            // Delete all files in the filesystem
-            await Promise.all(nestedFilePaths.map(async filePath => {
-                try {
-                    await fs.unlinkSync(filePath);
-                    console.log(`File deleted: ${filePath}`);
-                } catch (error) {
-                    if (error.code !== 'ENOENT') {
+        for (const file of files) {
+            if (file.path) { // Ensure the path is defined
+                const filePath = path.join(this.uploadDirectory, file.path);
+                console.log(filePath);
+                if (fs.existsSync(filePath)) {
+                    try {
+                        fs.unlinkSync(filePath);
+                        console.log(`File deleted: ${filePath}`);
+                        deletionResults.filesDeleted++;
+                    } catch (error) {
                         console.error(`Error deleting file: ${filePath}, Error: ${error.message}`);
                     }
                 }
-            }));
+            } else {
+                console.warn(`File path is undefined for file ID: ${file._id}`);
+            }
+        }
 
-            // Delete folders in the filesystem
-            await Promise.all(nestedFolderPaths.map(async folderPath => {
-                try {
-                    await fs.rmSync(folderPath, { recursive: true, force: true });
-                    console.log(`Folder deleted: ${folderPath}`);
-                } catch (error) {
-                    if (error.code !== 'ENOENT') {
+        for (const folder of folders) {
+            if (folder.path) { // Ensure the path is defined
+                const folderPath = path.join(this.uploadDirectory, folder.path);
+                console.log(folderPath);
+                if (fs.existsSync(folderPath)) {
+                    try {
+                        fs.rmSync(folderPath, { recursive: true, force: true });
+                        console.log(`Folder deleted: ${folderPath}`);
+                        deletionResults.foldersDeleted++;
+                    } catch (error) {
                         console.error(`Error deleting folder: ${folderPath}, Error: ${error.message}`);
                     }
                 }
-            }));
+            } else {
+                console.warn(`Folder path is undefined for folder ID: ${folder._id}`);
+            }
+        }
 
-            // Mark nested files and folders as deleted in the database
-            await Promise.all([
-                File.updateMany({ userId: userId, path: new RegExp(`^${folderPath}/`) }, { $set: { deleted: true } }),
-                Folder.updateMany({ userId: userId, path: new RegExp(`^${folderPath}/`) }, { $set: { deleted: true } })
-            ]);
+        const deleteDbRecords = async () => {
+            const fileUpdateResult = await File.updateMany(
+                { _id: { $in: ids } },
+                { $set: { deleted: true } }
+            );
+            const folderUpdateResult = await Folder.updateMany(
+                { _id: { $in: ids } },
+                { $set: { deleted: true } }
+            );
+
+            return {
+                filesModified: fileUpdateResult.nModified,
+                foldersModified: folderUpdateResult.nModified
+            };
         };
 
-        // Delete top-level files in the filesystem
-        await Promise.all(filePaths.map(async filePath => {
-            try {
-                await fs.unlinkSync(filePath, () => {});
-                console.log(`File deleted: ${filePath}`);
-            } catch (error) {
-                if (error.code !== 'ENOENT') {
-                    console.error(`Error deleting file: ${filePath}, Error: ${error.message}`);
-                }
+        const result = await deleteDbRecords();
+
+        console.log(`Files deleted: ${deletionResults.filesDeleted}, Folders deleted: ${deletionResults.foldersDeleted}`);
+        console.log(`Database - Files modified: ${result.filesModified}, Folders modified: ${result.foldersModified}`);
+
+        return deletionResults.filesDeleted + deletionResults.foldersDeleted;
+    }
+
+    static async deleteFolderRecursively(folderId, userId) {
+        try {
+            // Find the folder to delete
+            const folderToDelete = await Folder.findOne({ _id: folderId, userId });
+
+            if (!folderToDelete) {
+                throw new Error(`Folder with ID ${folderId} not found.`);
             }
-        }));
 
-        // Process each folder to delete its contents and itself
-        await Promise.all(folders.map(async folder => {
-            const folderPath = path.join(__dirname, '../../public/uploads', folder.path);
-            await deleteFolderContents(folder.path); // Recursively delete contents
-            try {
-                await fs.rmSync(folderPath, { recursive: true, force: true });
-                console.log(`Folder deleted: ${folderPath}`);
-            } catch (error) {
-                if (error.code !== 'ENOENT') {
-                    console.error(`Error deleting folder: ${folderPath}, Error: ${error.message}`);
-                }
+            // Recursively find all subfolders and files within the specified folder
+            const subFolders = await Folder.find({
+                path: new RegExp(`^${folderToDelete.path}/`),
+                userId
+            });
+            const subFolderIds = subFolders.map(folder => folder._id);
+
+            // Find all files within the folder and its subfolders
+            const filesToDelete = await File.find({
+                path: new RegExp(`^${folderToDelete.path}/`),
+                userId
+            });
+            const fileIds = filesToDelete.map(file => file._id);
+
+            // Delete all subfolder and file documents in one go
+            await Folder.deleteMany({ _id: { $in: [folderId, ...subFolderIds] } });
+            await File.deleteMany({ _id: { $in: fileIds } });
+
+            console.log(`Deleted folder ${folderToDelete.name} and its contents.`);
+
+            // Delete folders and files from filesystem
+            const folderPath = path.join(this.uploadDirectory, folderToDelete.path);
+            if (fs.existsSync(folderPath)) {
+                fs.rmSync(folderPath, { recursive: true, force: true });
+                console.log(`Deleted folder and all contents from filesystem at ${folderPath}`);
             }
-        }));
 
-        // Mark top-level files and folders as deleted in the database in batch
-        const result = await Promise.all([
-            File.updateMany({ _id: { $in: ids }, userId: userId }, { $set: { deleted: true } }),
-            Folder.updateMany({ _id: { $in: ids }, userId: userId }, { $set: { deleted: true } })
-        ]);
-
-        console.log(`Files modified: ${result[0].nModified}, Folders modified: ${result[1].nModified}`);
-        return result[0].nModified + result[1].nModified;
+            return { message: 'Folder and all its contents deleted successfully.' };
+        } catch (error) {
+            console.error('Error deleting folder recursively:', error);
+            throw new Error('Failed to delete folder and its contents.');
+        }
     }
 
     static async viewFile(userId, fileId) {
@@ -277,25 +302,40 @@ class FileService {
         return { filePath, mimeType };
     }
 
-    static async createFolder(userId, name) {
-        const folderPath = path.join(this.uploadDirectory, userId, name);
-
-        // Check if folder already exists in the filesystem
-        if (fs.existsSync(folderPath)) {
-            throw new Error('Folder already exists');
+    static async createFolder(userId, folderName, parent_id = null) {
+        if (!userId || !folderName) {
+            throw new Error('userId and folderName are required');
         }
 
-        // Create the folder in the filesystem
-        fs.mkdirSync(folderPath, { recursive: true });
+        // Determine the folder's relative path based on parent_id
+        let folderPath = userId; // Start the path with userId as the base directory
 
-        // Save folder info to the database
-        const folderRecord = new Folder({
-            name,
-            path: folderPath,
-            userId: userId
+        if (parent_id) {
+            const parentFolder = await Folder.findById(parent_id);
+            if (!parentFolder || parentFolder.userId !== userId) {
+                throw new Error('Parent folder not found or access denied');
+            }
+            folderPath = path.join(parentFolder.path, folderName); // Path relative to parent folder
+        } else {
+            folderPath = path.join(userId, folderName); // Top-level folder under user’s directory
+        }
+
+        const fullPath = path.join(FileService.uploadDirectory, folderPath); // Full path for filesystem
+
+        // Create the directory in the filesystem
+        await fs.mkdirSync(fullPath, { recursive: true });
+
+        // Save folder information in the database
+        const newFolder = new Folder({
+            userId,
+            name: folderName,
+            path: folderPath, // Save as relative path including userId
+            createdAt: new Date()
         });
 
-        return await folderRecord.save();
+        await newFolder.save();
+
+        return newFolder;
     }
 
     static async compressFiles(userId, items, folder = '', zipFileName = null) {
@@ -322,7 +362,7 @@ class FileService {
                     // Attempt to create a new File record for the compressed file
                     const compressedFile = new File({
                         name,
-                        path: path.join(this.uploadDirectory, userId, folder, name),
+                        path: path.join(userId, folder, name),
                         size: stats.size,
                         mimetype: 'application/zip',
                         createdAt: new Date(),
@@ -361,133 +401,109 @@ class FileService {
         });
     }
 
-    static async decompressFile(userId, filePath, targetFolder) {
-        if (!filePath) {
-            throw new Error("filePath is required");
+    static async decompressFile(userId, zipFilePath, destinationFolder = '.', merge = false) {
+        // Define the root directory
+        const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+        const absoluteDestination = path.resolve(rootDir, destinationFolder);
+        const extractionDir = absoluteDestination;
+        zipFilePath = path.join(this.uploadDirectory, zipFilePath);
+
+        // Prevent directory traversal attack
+        if (!absoluteDestination.startsWith(rootDir)) {
+            throw new Error('Invalid destination folder. Directory traversal is not allowed.');
         }
 
-        // Determine the full path of the file and output folder
-        const fullPath = path.join(this.uploadDirectory, userId, filePath);
-        console.log('Full path of the zip file:', fullPath);
-
-        if (!fs.existsSync(fullPath)) {
-            throw new Error("Zip file not found");
+        // Ensure the destination folder exists or create it
+        if (!merge) {
+            fs.rmSync(absoluteDestination, { recursive: true, force: true });
         }
+        fs.mkdirSync(extractionDir, { recursive: true });
 
-        // Define the output folder for decompression, using targetFolder as specified
-        const outputFolder = path.join(path.dirname(fullPath), targetFolder);
-        console.log('Output folder for decompression:', outputFolder);
+        // Extract the ZIP file
+        await extract(zipFilePath, { dir: extractionDir });
 
-        // Ensure the output folder exists before extraction
-        if (!fs.existsSync(outputFolder)) {
-            fs.mkdirSync(outputFolder, { recursive: true });
-        }
-
-        return new Promise((resolve, reject) => {
-            fs.createReadStream(fullPath)
-                .pipe(unzipper.Extract({ path: outputFolder })) // Specify the exact path for decompression
-                .on('close', async () => {
-                    try {
-                        console.log(`Decompression complete. Files should be in ${outputFolder}`);
-                        await this.registerExtractedFiles(outputFolder, path.basename(targetFolder)); // Register with targetFolder as parent
-                        resolve({ message: 'File decompressed successfully' });
-                    } catch (error) {
-                        console.error('Error registering extracted files:', error);
-                        reject(new Error('Failed to register extracted files'));
-                    }
-                })
-                .on('error', (err) => {
-                    console.error('Error during decompression:', err);
-                    reject(new Error('Failed to decompress file'));
-                });
-        });
+        await this.saveExtractedContentsInDb(rootDir, extractionDir, userId, null, true);
+        return absoluteDestination;
     }
 
-    static async registerExtractedFiles(outputFolder, parentFolder) {
-        console.log(`Registering files in folder: ${outputFolder} under parent: ${parentFolder}`);
+    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentFolderId = null, isMainFolder = false) {
+        const relativePath = path.join(userId, path.relative(rootDir, currentPath));
 
-        // First, check if the main decompressed folder (parentFolder) itself is registered in the database
-        if (!(await Folder.findOne({ path: parentFolder }))) {
-            console.log(`Creating main decompressed folder in DB: ${parentFolder}`);
-            await Folder.create({
-                name: path.basename(parentFolder),
-                path: parentFolder,
-                createdAt: new Date()
-            });
+        // Create a folder document for the main extraction folder if needed
+        if (isMainFolder) {
+            let mainFolderDoc = await Folder.findOne({ path: relativePath, userId });
+            if (!mainFolderDoc) {
+                mainFolderDoc = new Folder({
+                    name: path.basename(currentPath),
+                    path: relativePath,
+                    parent_id: parentFolderId,
+                    userId,
+                });
+                await mainFolderDoc.save();
+            }
+            parentFolderId = mainFolderDoc._id;
         }
 
-        // Now process the contents of the decompressed folder
-        const items = fs.readdirSync(outputFolder);
-        console.log(`Found items: ${items.join(', ')}`);
+        // Create a folder document for the current path if it doesn't exist
+        let folderDoc = await Folder.findOne({ path: relativePath, userId });
+        if (!folderDoc) {
+            folderDoc = new Folder({
+                name: path.basename(currentPath),
+                path: relativePath,
+                parent_id: parentFolderId,
+                userId,
+            });
+            await folderDoc.save();
+        }
+        parentFolderId = folderDoc._id;
 
-        // Preload existing folders and files within the specified parent folder
-        const existingFolders = await Folder.find({ path: new RegExp(`^${parentFolder}/`) });
-        const existingFiles = await File.find({ path: new RegExp(`^${parentFolder}/`), deleted: false });
-
-        // Create sets for efficient existence checking
-        const existingFolderPaths = new Set(existingFolders.map(folder => folder.path));
-        const existingFilePaths = new Set(existingFiles.map(file => file.path));
-
-        // Arrays for batch insertion of new folders and files
-        const newFolders = [];
-        const newFiles = [];
+        const items = fs.readdirSync(currentPath);
 
         for (const item of items) {
-            const itemPath = path.join(outputFolder, item);
+            const itemPath = path.join(currentPath, item);
             const stats = fs.statSync(itemPath);
-
-            // Define the correct path for each item in the database
-            const dbPath = path.join(parentFolder, item);
+            const itemRelativePath = path.join(userId, path.relative(rootDir, itemPath));
 
             if (stats.isDirectory()) {
-                console.log(`Detected directory: ${dbPath}`);
-
-                if (!existingFolderPaths.has(dbPath)) {
-                    console.log(`Adding folder to batch: ${dbPath}`);
-                    newFolders.push({
+                // Check if folder document already exists
+                let folder = await Folder.findOne({ path: itemRelativePath, userId });
+                if (!folder) {
+                    // Create a folder document if it doesn't exist
+                    folder = new Folder({
                         name: item,
-                        path: dbPath,
-                        createdAt: new Date()
+                        path: itemRelativePath,
+                        parent_id: parentFolderId,
+                        userId,
                     });
+                    await folder.save();
                 }
+                const newParentFolderId = folder._id;
 
-                // Recursively register the contents of this folder
-                await FileService.registerExtractedFiles(itemPath, dbPath);
+                // Recursively create documents for the folder contents
+                await this.saveExtractedContentsInDb(rootDir, itemPath, userId, newParentFolderId);
             } else {
-                if (!existingFilePaths.has(dbPath)) {
-                    console.log(`Adding file to batch: ${dbPath}`);
-                    const mimetype = mime.getType(item) || 'application/octet-stream';
-                    newFiles.push({
+                // Check if file document already exists
+                let file = await File.findOne({ path: itemRelativePath, userId });
+                if (!file) {
+                    // Create a file document if it doesn't exist
+                    const mimeType = mime.getType(itemPath) || 'application/octet-stream';
+                    file = new File({
                         name: item,
-                        path: dbPath,
+                        path: itemRelativePath,
+                        parent_id: parentFolderId,
                         size: stats.size,
-                        mimetype: mimetype,
-                        createdAt: new Date(),
-                        deleted: false
+                        mimetype: mimeType,
+                        userId,
                     });
+                    await file.save();
                 }
             }
         }
-
-        // Perform batch insertion of new folders and files
-        if (newFolders.length > 0) {
-            console.log(`Inserting new folders: ${newFolders.map(folder => folder.path).join(', ')}`);
-            await Folder.insertMany(newFolders);
-        } else {
-            console.log('No new folders to insert.');
-        }
-
-        if (newFiles.length > 0) {
-            console.log(`Inserting new files: ${newFiles.map(file => file.path).join(', ')}`);
-            await File.insertMany(newFiles);
-        } else {
-            console.log('No new files to insert.');
-        }
     }
 
-    static async renameItem(itemId, newName, isFolder) {
-        if (!itemId || !newName) {
-            throw new Error('itemId and newName are required');
+    static async renameItem(userId, itemId, newName, isFolder) {
+        if (!userId || !itemId || !newName) {
+            throw new Error('userId, itemId, and newName are required');
         }
 
         let item, oldPath, newPath;
@@ -495,54 +511,59 @@ class FileService {
         if (isFolder) {
             // Find the folder by ID
             item = await Folder.findById(itemId);
-            if (!item) throw new Error('Folder not found');
+            if (!item || item.userId !== userId) throw new Error('Folder not found or access denied');
 
             // Set old and new paths for renaming
-            oldPath = path.join(__dirname, '../../public/uploads', item.path);
+            oldPath = item.path;
             newPath = path.join(path.dirname(oldPath), newName);
 
-            // Rename folder in the filesystem
-            await fs.rename(oldPath, newPath);
+            // Rename the folder in the filesystem
+            await fs.renameSync(
+                path.join(this.uploadDirectory, oldPath),
+                path.join(this.uploadDirectory, newPath)
+            );
 
             // Update the folder's own path in the database
-            const newDbPath = path.join(path.dirname(item.path), newName);
             item.name = newName;
-            item.path = newDbPath;
+            item.path = newPath;
             await item.save();
 
-            // Find all child files and folders with paths starting with the old path
-            const childFiles = await File.find({ path: new RegExp(`^${item.path}/`) });
-            const childFolders = await Folder.find({ path: new RegExp(`^${item.path}/`) });
+            // Update all child folders and files with paths that start with the old path
+            const oldPathSegment = oldPath;
+            const updatedPathSegment = newPath;
 
-            // Update each child item to reflect the new path
-            const updatePromises = [
-                ...childFiles.map(file => {
-                    file.path = file.path.replace(item.path, newDbPath);
-                    return file.save();
-                }),
-                ...childFolders.map(folder => {
-                    folder.path = folder.path.replace(item.path, newDbPath);
-                    return folder.save();
-                })
-            ];
+            // Find and update child folders
+            const childFolders = await Folder.find({ path: new RegExp(`^${oldPathSegment}/`) });
+            const updateFolderPromises = childFolders.map(folder => {
+                folder.path = folder.path.replace(oldPathSegment, updatedPathSegment);
+                return folder.save();
+            });
 
-            await Promise.all(updatePromises);
+            // Find and update child files
+            const childFiles = await File.find({ path: new RegExp(`^${oldPathSegment}/`) });
+            const updateFilePromises = childFiles.map(file => {
+                file.path = file.path.replace(oldPathSegment, updatedPathSegment);
+                return file.save();
+            });
+
+            // Execute updates in parallel
+            await Promise.all([...updateFolderPromises, ...updateFilePromises]);
 
         } else {
             // Find the file by ID
             item = await File.findById(itemId);
-            if (!item) throw new Error('File not found');
+            if (!item || item.userId !== userId) throw new Error('File not found or access denied');
 
             // Set old and new paths for renaming
-            oldPath = path.join(__dirname, '../../public/uploads', item.path);
+            oldPath = item.path;
             newPath = path.join(path.dirname(oldPath), newName);
 
-            // Rename file in the filesystem
+            // Rename the file in the filesystem
             await fs.rename(oldPath, newPath);
 
             // Update the file's name and path in the database
             item.name = newName;
-            item.path = path.join(path.dirname(item.path), newName);
+            item.path = newPath;
             await item.save();
         }
 

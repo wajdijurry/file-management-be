@@ -9,7 +9,8 @@ const {
     viewFile,
     createFolder,
     compressFiles,
-    decompressFile
+    decompressFile,
+    renameItem
 } = require('../controllers/fileController');
 
 const multer = require('multer');
@@ -25,5 +26,6 @@ router.get('/view/:fileId', viewFile);
 router.post('/create-folder', createFolder);
 router.post('/compress', compressFiles);
 router.post('/decompress', decompressFile);
+router.post('/rename', renameItem);
 
 module.exports = router;
