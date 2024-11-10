@@ -3,14 +3,14 @@ const FileService = require('../services/fileService');
 // Upload file
 exports.uploadFiles = async (req, res) => {
     try {
-        const folder = req.body.folder || ''; // Retrieve folder path from request body (defaults to root)
+        const folder_id = req.body.folder_id || ''; // Retrieve folder path from request body (defaults to root)
         const files = req.files; // Access uploaded files
 
         if (!files || files.length === 0) {
             return res.status(400).json({ error: 'No files uploaded' });
         }
 
-        const results = await FileService.uploadFiles(req.userId, files, folder); // Pass files and target folder to the service
+        const results = await FileService.uploadFiles(req.userId, files, folder_id); // Pass files and target folder to the service
         res.status(200).json({ message: 'Files uploaded successfully', results });
     } catch (error) {
         console.error('Error uploading files:', error);
@@ -22,8 +22,9 @@ exports.uploadFiles = async (req, res) => {
 exports.getFiles = async (req, res) => {
     try {
         const folderName = req.query.folder || '';
+        const parentFolderId = req.query.parent_id || null;
 
-        const files = await FileService.getFiles(req.userId, folderName);
+        const files = await FileService.getFiles(req.userId, folderName, parentFolderId);
         res.status(200).json(files);
     } catch (err) {
         res.status(500).json({ error: err.message });

@@ -9,9 +9,14 @@ const extract = require('extract-zip');
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
 
-    static async uploadFiles(userId, files, folder = '') {
-        let uploadDirectory = path.join(this.uploadDirectory, userId);
-        const targetPath = folder ? path.join(uploadDirectory, folder) : uploadDirectory;
+    static async uploadFiles(userId, files, parentId = null) {
+        let folder = Folder.findOne({_id: parentId});
+
+        if (!folder) {
+            throw new Error('Selected folder does not exist.');
+        }
+
+        const targetPath = path.join(this.uploadDirectory, folder.path);
 
         // Ensure the target folder exists
         if (!fs.existsSync(targetPath)) {
@@ -65,7 +70,7 @@ class FileService {
         return totalSize;
     }
 
-    static async getFiles(userId, folderName = '') {
+    static async getFiles(userId, folderName = '', parentId = null) {
         // Set the target path based on folderName, defaulting to the root upload directory
         let uploadDirectory = path.join(this.uploadDirectory, userId);
         const targetPath = folderName ? path.join(uploadDirectory, folderName) : uploadDirectory;
@@ -80,17 +85,14 @@ class FileService {
         // Find folders in the specified directory
         const folderRecords = await Folder.find({
             userId: userId,
-            name: { $in: items },
-            deleted: false,
-            // path: folderName
-            //     ? new RegExp(`^${folderName}/[^/]+$`) // Match folders directly under the specified folderName
-            //     : new RegExp('\s+') // Match only top-level folders when folderName is empty (root directory)
+            parent_id: parentId,
+            deleted: false
         }).exec();
 
         // Find files in the specified directory
         const fileRecords = await File.find({
             userId: userId,
-            name: { $in: items },
+            parent_id: parentId,
             deleted: false
         }).exec();
 
@@ -322,8 +324,10 @@ class FileService {
 
         const fullPath = path.join(FileService.uploadDirectory, folderPath); // Full path for filesystem
 
+        console.log(fullPath);
+
         // Create the directory in the filesystem
-        await fs.mkdirSync(fullPath, { recursive: true });
+        fs.mkdirSync(fullPath, { recursive: true });
 
         // Save folder information in the database
         const newFolder = new Folder({
