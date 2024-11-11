@@ -24,7 +24,7 @@ exports.getFiles = async (req, res) => {
         const folderName = req.query.folder || '';
         const parentFolderId = req.query.parent_id || null;
 
-        const files = await FileService.getFiles(req.userId, folderName, parentFolderId);
+        const files = await FileService.getFiles(req.userId, parentFolderId);
         res.status(200).json(files);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -50,7 +50,7 @@ exports.viewFile = async (req, res) => {
             res.setHeader('Content-Type', mimeType);
         }
 
-        if (mimeType === 'application/pdf') {
+        if (['application/pdf'].includes(mimeType)) {
             res.setHeader('Content-Disposition', 'inline');
         }
 

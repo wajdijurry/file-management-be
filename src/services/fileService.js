@@ -10,13 +10,14 @@ class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
 
     static async uploadFiles(userId, files, parentId = null) {
-        let folder = Folder.findOne({_id: parentId});
+        let folder = null;
 
-        if (!folder) {
-            throw new Error('Selected folder does not exist.');
+        if (parentId) {
+            folder = await Folder.findOne({_id: parentId}).exec();
         }
 
-        const targetPath = path.join(this.uploadDirectory, folder.path);
+        const fileDbPath = folder ? folder.path : userId;
+        const targetPath = path.join(this.uploadDirectory, fileDbPath);
 
         // Ensure the target folder exists
         if (!fs.existsSync(targetPath)) {
@@ -34,7 +35,8 @@ class FileService {
             // Save file metadata to the database
             const fileRecord = new File({
                 name: file.originalname,
-                path: path.join(userId, folder, file.originalname), // Store relative path in DB
+                path: path.join(fileDbPath, file.originalname), // Store relative path in DB
+                parent_id: parentId ? parentId : null,
                 size: file.size,
                 mimetype: file.mimetype,
                 createdAt: new Date(),
@@ -70,58 +72,38 @@ class FileService {
         return totalSize;
     }
 
-    static async getFiles(userId, folderName = '', parentId = null) {
-        // Set the target path based on folderName, defaulting to the root upload directory
-        let uploadDirectory = path.join(this.uploadDirectory, userId);
-        const targetPath = folderName ? path.join(uploadDirectory, folderName) : uploadDirectory;
-
-        if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
-            throw new Error(`The folder "${folderName}" does not exist.`);
-        }
-
-        // List all items (files and folders) in the target directory
-        const items = fs.readdirSync(targetPath);
-
-        // Find folders in the specified directory
+    static async getFiles(userId, parentId = null) {
+        // Fetch folders and files from the database based on parent_id
         const folderRecords = await Folder.find({
             userId: userId,
             parent_id: parentId,
             deleted: false
         }).exec();
 
-        // Find files in the specified directory
         const fileRecords = await File.find({
             userId: userId,
             parent_id: parentId,
             deleted: false
         }).exec();
 
-        // Create lookup maps for quick reference
-        const folderDataMap = folderRecords.reduce((acc, folder) => {
-            acc[folder.name] = folder;
-            return acc;
-        }, {});
+        // Set the target path based on parentId, defaulting to the root upload directory
+        let uploadDirectory = this.uploadDirectory;
 
-        const fileDataMap = fileRecords.reduce((acc, file) => {
-            acc[file.name] = file;
-            return acc;
-        }, {});
-
-        // Build the response data
-        const filesAndFolders = await Promise.all(items.map(async item => {
-            const itemPath = path.join(targetPath, item);
-            const stats = fs.statSync(itemPath);
-            const isFolder = stats.isDirectory();
-
-            if (isFolder) {
-                const folderRecord = folderDataMap[item];
-                if (!folderRecord) return null; // Ignore if the folder is not in the database
+        // Build the response data by fetching folders and files from disk
+        const filesAndFolders = await Promise.all([
+            ...folderRecords.map(async folderRecord => {
+                const folderPath = path.join(uploadDirectory, folderRecord.path);
+                if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) {
+                    return null; // Ignore if the folder does not exist on disk
+                }
 
                 // Calculate folder size recursively if needed
-                const folderSize = FileService.calculateFolderSize(itemPath);
+                const folderSize = FileService.calculateFolderSize(folderPath);
+                const stats = fs.statSync(folderPath);
+
                 return {
                     _id: folderRecord._id,
-                    name: item,
+                    name: folderRecord.name,
                     isFolder: true,
                     size: folderSize,
                     createdAt: stats.ctime,
@@ -130,25 +112,108 @@ class FileService {
                     folderCount: folderRecord.folderCount || 0,
                     path: folderRecord.path
                 };
-            } else {
-                const fileRecord = fileDataMap[item];
-                return fileRecord
-                    ? {
-                        _id: fileRecord._id,
-                        name: fileRecord.name,
-                        isFolder: false,
-                        size: fileRecord.size,
-                        createdAt: fileRecord.createdAt,
-                        mimetype: fileRecord.mimetype,
-                        path: fileRecord.path
-                    }
-                    : null;
-            }
-        }));
+            }),
+            ...fileRecords.map(fileRecord => {
+                const filePath = path.join(uploadDirectory, fileRecord.path);
+                if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+                    return null; // Ignore if the file does not exist on disk
+                }
 
-        // Filter out any null entries (e.g., missing files or folders in the database)
+                return {
+                    _id: fileRecord._id,
+                    name: fileRecord.name,
+                    isFolder: false,
+                    size: fileRecord.size,
+                    createdAt: fileRecord.createdAt,
+                    mimetype: fileRecord.mimetype,
+                    path: fileRecord.path
+                };
+            })
+        ]);
+
+        // Filter out any null entries (e.g., missing files or folders on disk)
         return filesAndFolders.filter(item => item);
     }
+
+    // static async getFiles(userId, folderName = '', parentId = null) {
+    //     // Set the target path based on folderName, defaulting to the root upload directory
+    //     let uploadDirectory = path.join(this.uploadDirectory, userId);
+    //     const targetPath = folderName ? path.join(uploadDirectory, folderName) : uploadDirectory;
+    //
+    //     if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
+    //         throw new Error(`The folder "${folderName}" does not exist.`);
+    //     }
+    //
+    //     // List all items (files and folders) in the target directory
+    //     const items = fs.readdirSync(targetPath);
+    //
+    //     // Find folders in the specified directory
+    //     const folderRecords = await Folder.find({
+    //         userId: userId,
+    //         parent_id: parentId,
+    //         deleted: false
+    //     }).exec();
+    //
+    //     // Find files in the specified directory
+    //     const fileRecords = await File.find({
+    //         userId: userId,
+    //         parent_id: parentId,
+    //         deleted: false
+    //     }).exec();
+    //
+    //     // Create lookup maps for quick reference
+    //     const folderDataMap = folderRecords.reduce((acc, folder) => {
+    //         acc[folder.name] = folder;
+    //         return acc;
+    //     }, {});
+    //
+    //     const fileDataMap = fileRecords.reduce((acc, file) => {
+    //         acc[file.name] = file;
+    //         return acc;
+    //     }, {});
+    //
+    //     // Build the response data
+    //     const filesAndFolders = await Promise.all(items.map(async item => {
+    //         const itemPath = path.join(targetPath, item);
+    //         const stats = fs.statSync(itemPath);
+    //         const isFolder = stats.isDirectory();
+    //
+    //         if (isFolder) {
+    //             const folderRecord = folderDataMap[item];
+    //             if (!folderRecord) return null; // Ignore if the folder is not in the database
+    //
+    //             // Calculate folder size recursively if needed
+    //             const folderSize = FileService.calculateFolderSize(itemPath);
+    //             return {
+    //                 _id: folderRecord._id,
+    //                 name: item,
+    //                 isFolder: true,
+    //                 size: folderSize,
+    //                 createdAt: stats.ctime,
+    //                 mimetype: '',
+    //                 fileCount: folderRecord.fileCount || 0,
+    //                 folderCount: folderRecord.folderCount || 0,
+    //                 path: folderRecord.path
+    //             };
+    //         } else {
+    //             const fileRecord = fileDataMap[item];
+    //             return fileRecord
+    //                 ? {
+    //                     _id: fileRecord._id,
+    //                     name: fileRecord.name,
+    //                     isFolder: false,
+    //                     size: fileRecord.size,
+    //                     createdAt: fileRecord.createdAt,
+    //                     mimetype: fileRecord.mimetype,
+    //                     path: fileRecord.path
+    //                 }
+    //                 : null;
+    //         }
+    //     }));
+    //
+    //     // Filter out any null entries (e.g., missing files or folders in the database)
+    //     return filesAndFolders.filter(item => item);
+    // }
 
     static async getFileById(userId, id) {
         return File.findOne({ _id: id, userId: userId, deleted: false });
@@ -324,14 +389,13 @@ class FileService {
 
         const fullPath = path.join(FileService.uploadDirectory, folderPath); // Full path for filesystem
 
-        console.log(fullPath);
-
         // Create the directory in the filesystem
         fs.mkdirSync(fullPath, { recursive: true });
 
         // Save folder information in the database
         const newFolder = new Folder({
             userId,
+            parent_id: parent_id,
             name: folderName,
             path: folderPath, // Save as relative path including userId
             createdAt: new Date()
