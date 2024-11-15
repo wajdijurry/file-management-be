@@ -1,4 +1,6 @@
 const FileService = require('../services/fileService');
+const path = require('path');
+const fs = require('fs');
 
 // Upload file
 exports.uploadFiles = async (req, res) => {
@@ -128,8 +130,8 @@ exports.createFolder = async (req, res) => {
 
 exports.compressFiles = async (req, res) => {
     try {
-        const { items, folder, zipFileName } = req.body;
-        const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName);
+        const { items, folder, zipFileName, parentId } = req.body;
+        const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId);
         res.status(200).json({ message: 'Files compressed successfully', file: compressedFile });
     } catch (error) {
         console.error('Error compressing files:', error);
@@ -139,14 +141,14 @@ exports.compressFiles = async (req, res) => {
 
 exports.decompressFile = async (req, res) => {
     try {
-        const { filePath, targetFolder, merge } = req.body;
+        const { filePath, targetFolder, merge, parentId } = req.body;
 
         if (!filePath || !targetFolder) {
             return res.status(400).json({ error: 'filePath and targetFolder are required' });
         }
 
         console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge);
+        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
         res.status(200).json(result);
     } catch (error) {
         console.error('Error decompressing file:', error);
@@ -160,7 +162,85 @@ exports.renameItem = async (req, res) => {
         await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder);
         res.json({ success: true, message: 'File/Folder renamed successfully.' });
     } catch (err) {
-        console.log(err);
         res.status(500).json({ success: false, message: 'Failed to rename file/folder.' });
+    }
+};
+
+exports.moveItem = async (req, res) => {
+    const { itemId, targetFolderId } = req.body;
+
+    try {
+        const result = await FileService.moveItem(itemId, targetFolderId);
+        res.status(200).json(result);
+    } catch (error) {
+        console.error('Error moving item:', error.message);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.download = async (req, res) => {
+    const filePath = req.body.filePath;
+    const absolutePath = path.join(FileService.uploadDirectory, filePath);
+
+    try {
+        if (!fs.existsSync(absolutePath)) {
+            return res.status(404).send('File not found.');
+        }
+
+        const stats = fs.statSync(absolutePath);
+        const fileSize = stats.size;
+        const range = req.headers.range;
+
+        if (range) {
+            // Parse the Range header
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+            if (start >= fileSize) {
+                res.status(416).send('Requested range not satisfiable');
+                return;
+            }
+
+            const chunkSize = end - start + 1;
+            const fileStream = fs.createReadStream(absolutePath, { start, end });
+
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunkSize,
+                'Content-Type': 'application/octet-stream',
+            });
+
+            fileStream.pipe(res);
+        } else {
+            // Full file download
+            res.writeHead(200, {
+                'Content-Length': fileSize,
+                'Content-Type': 'application/octet-stream',
+            });
+
+            fs.createReadStream(absolutePath).pipe(res);
+        }
+    } catch (error) {
+        console.error('Error during download:', error.message);
+        res.status(500).send('Failed to download file.');
+    }
+};
+
+exports.getFileSize = async (req, res) => {
+    const filePath = path.join(FileService.uploadDirectory, req.body.filePath);
+    const absolutePath = path.resolve(filePath);
+
+    try {
+        if (!fs.existsSync(absolutePath)) {
+            return res.status(404).send('File not found.');
+        }
+
+        const stats = fs.statSync(absolutePath);
+        res.json({ fileSize: stats.size });
+    } catch (error) {
+        console.error('Error fetching file size:', error.message);
+        res.status(500).send('Failed to retrieve file size.');
     }
 };

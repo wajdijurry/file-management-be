@@ -11,4 +11,12 @@ const folderSchema = new mongoose.Schema({
     userId: {type: String, ref: 'User', required: true}
 });
 
+// Virtual field `isFolder` to indicate that the document is a folder
+folderSchema.virtual('isFolder').get(function() {
+    return true;
+});
+
+folderSchema.set('toJSON', { virtuals: true });
+folderSchema.set('toObject', { virtuals: true });
+
 module.exports = mongoose.model('Folder', folderSchema);
