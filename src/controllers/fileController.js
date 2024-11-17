@@ -113,14 +113,14 @@ exports.deleteFile = async (req, res) => {
 
 // Function to delete multiple files
 exports.deleteMultipleFiles = async (req, res) => {
-    const { ids } = req.body;
+    const { ids, parentId } = req.body;
 
     if (!Array.isArray(ids) || ids.length === 0) {
         return res.status(400).json({ success: false, message: 'No file IDs provided.' });
     }
 
     try {
-        const deletedCount = await FileService.deleteMultipleFiles(req.userId, ids);
+        const deletedCount = await FileService.deleteMultipleFiles(req.userId, ids, parentId);
 
         if (deletedCount > 0) {
             return res.json({ success: true, message: 'Files deleted successfully.', deletedCount });

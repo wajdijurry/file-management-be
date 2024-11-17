@@ -107,6 +107,7 @@ class FileService {
             writeStream.end();
 
             await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream);
+            this.recalculateFolderStats(parentId);
 
             // Remove the chunks directory
             fs.rmdirSync(chunkDir);
@@ -234,10 +235,14 @@ class FileService {
             throw new Error('File not found');
         }
         file.deleted = true; // Assuming you have a 'deleted' field
-        return await file.save();
+        await file.save();
+
+        if (file.parent_id) {
+            this.recalculateFolderStats(file.parent_id);
+        }
     }
 
-    static async deleteMultipleFiles(userId, ids) {
+    static async deleteMultipleFiles(userId, ids, parentId) {
         // Find files and folders to be deleted
         const files = await File.find({ _id: { $in: ids }, userId: userId, deleted: false });
         const folders = await Folder.find({ _id: { $in: ids }, userId: userId, deleted: false });
@@ -301,6 +306,8 @@ class FileService {
 
         console.log(`Files deleted: ${deletionResults.filesDeleted}, Folders deleted: ${deletionResults.foldersDeleted}`);
         console.log(`Database - Files modified: ${result.filesModified}, Folders modified: ${result.foldersModified}`);
+
+        this.recalculateFolderStats(parentId);
 
         return deletionResults.filesDeleted + deletionResults.foldersDeleted;
     }
@@ -405,9 +412,6 @@ class FileService {
             throw new Error("The specified folder doesn't exist.");
         }
 
-        let fileCount = 0;
-        let folderCount = 0;
-
         return new Promise((resolve, reject) => {
             const output = fs.createWriteStream(zipFilePath);
             const archive = archiver('zip', { zlib: { level: 9 } });
@@ -456,15 +460,15 @@ class FileService {
                 const itemPath = path.join(this.uploadDirectory, userId, item);
                 if (fs.statSync(itemPath).isDirectory()) {
                     archive.directory(itemPath, item);
-                    folderCount++;
                 } else {
                     archive.file(itemPath, { name: item });
-                    fileCount++;
                 }
                 processedFiles++;
             });
 
             archive.finalize();
+
+            this.recalculateFolderStats(parentId);
         });
     }
 
@@ -528,6 +532,7 @@ class FileService {
                         userId,
                     });
                     await folder.save();
+                    this.recalculateFolderStats(folder._id.toString());
                 }
                 const newParentFolderId = folder._id;
 
@@ -721,6 +726,63 @@ class FileService {
             throw new Error('File does not exist.');
         }
         return absolutePath;
+    }
+
+    static async recalculateFolderStats(folderId)
+    {
+        try {
+            // Find the folder by its ID
+            const folder = await Folder.findById(folderId);
+            if (!folder) {
+                return;
+            }
+
+            // Initialize counters
+            let totalSize = 0;
+            let fileCount = 0;
+            let folderCount = 0;
+
+            // Read folder contents from the file system
+            const folderPath = path.join(this.uploadDirectory, folder.path);
+            const contents = await fs.readdir(folderPath, { withFileTypes: true });
+
+            for (const item of contents) {
+                const itemPath = `${folderPath}/${item.name}`;
+
+                if (item.isFile()) {
+                    // Get file size
+                    const stats = await fs.stat(itemPath);
+                    totalSize += stats.size;
+                    fileCount++;
+                } else if (item.isDirectory()) {
+                    // Count folder and recursively calculate its stats
+                    folderCount++;
+
+                    // Find the child folder in the database and recalculate its stats
+                    const childFolder = await Folder.findOne({ path: itemPath });
+                    if (childFolder) {
+                        const childStats = await this.recalculateFolderStats(childFolder._id);
+                        totalSize += childStats.totalSize;
+                        fileCount += childStats.fileCount;
+                        folderCount += childStats.folderCount;
+                    }
+                }
+            }
+
+            // Update the current folder stats
+            folder.size = totalSize;
+            folder.fileCount = fileCount;
+            folder.folderCount = folderCount;
+            await folder.save();
+
+            // Recalculate stats for parent folders if they exist
+            await this.recalculateFolderStats(folder.parent_id);
+
+            return { totalSize, fileCount, folderCount };
+        } catch (error) {
+            console.error(`Error recalculating folder stats: ${error.message}`);
+            throw error;
+        }
     }
 }
 

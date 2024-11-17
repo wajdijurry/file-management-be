@@ -8,6 +8,7 @@ const folderSchema = new mongoose.Schema({
     deleted: {type: Boolean, default: false},
     fileCount: {type: Number, default: 0},
     folderCount: {type: Number, default: 0},
+    size: {type: Number, required: true},
     userId: {type: String, ref: 'User', required: true}
 });
 
