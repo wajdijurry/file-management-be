@@ -18,9 +18,10 @@ const {
 
 const multer = require('multer');
 
-const upload = multer(); // Initialize multer with no storage option to handle file buffers
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
 
-router.post('/upload', upload.array('files'), uploadFiles);
+router.post('/upload', upload.single('chunk'), uploadFiles);
 router.get('/', getFiles);
 // router.get('/download/:name', downloadFile);
 router.delete('/:id', deleteFile);

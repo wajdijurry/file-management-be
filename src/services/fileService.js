@@ -9,46 +9,113 @@ const extract = require('extract-zip');
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
 
-    static async uploadFiles(userId, files, parentId = null) {
-        let folder = null;
+    // static async uploadFiles(userId, files, parentId = null) {
+    //     let folder = null;
+    //
+    //     if (parentId) {
+    //         folder = await Folder.findOne({_id: parentId}).exec();
+    //     }
+    //
+    //     const fileDbPath = folder ? folder.path : userId;
+    //     const targetPath = path.join(this.uploadDirectory, fileDbPath);
+    //
+    //     // Ensure the target folder exists
+    //     if (!fs.existsSync(targetPath)) {
+    //         fs.mkdirSync(targetPath, { recursive: true });
+    //     }
+    //
+    //     const results = [];
+    //
+    //     for (const file of files) {
+    //         const filePath = path.join(targetPath, file.originalname);
+    //
+    //         // Move the file to the target path
+    //         fs.writeFileSync(filePath, file.buffer);
+    //
+    //         // Save file metadata to the database
+    //         const fileRecord = new File({
+    //             name: file.originalname,
+    //             path: path.join(fileDbPath, file.originalname), // Store relative path in DB
+    //             parent_id: parentId ? parentId : null,
+    //             size: file.size,
+    //             mimetype: file.mimetype,
+    //             createdAt: new Date(),
+    //             deleted: false,
+    //             userId: userId
+    //         });
+    //         await fileRecord.save();
+    //
+    //         results.push({ name: file.originalname, path: fileRecord.path });
+    //     }
+    //
+    //     return results;
+    // }
 
-        if (parentId) {
-            folder = await Folder.findOne({_id: parentId}).exec();
+    static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks)
+    {
+        let uploadDir = FileService.uploadDirectory;
+        let relativeUploadDir = '';
+
+        if (folderId) {
+            let folder = await Folder.findById(folderId);
+            if (folder) {
+                uploadDir = path.join(uploadDir, folder.path);
+                relativeUploadDir = folder.path;
+            }
+        } else {
+            uploadDir = path.join(uploadDir, userId);
         }
 
-        const fileDbPath = folder ? folder.path : userId;
-        const targetPath = path.join(this.uploadDirectory, fileDbPath);
+        // Ensure chunk directory exists
+        fs.mkdirSync(uploadDir, { recursive: true });
 
-        // Ensure the target folder exists
-        if (!fs.existsSync(targetPath)) {
-            fs.mkdirSync(targetPath, { recursive: true });
+        // Save the chunk
+        let chunkDir = path.join(uploadDir, `chunks`);
+
+        if(!fs.existsSync(chunkDir)) {
+            fs.mkdirSync(chunkDir, { recursive: true });
         }
 
-        const results = [];
+        const chunkPath = path.join(chunkDir, `chunk_${currentChunk}`);
+        fs.writeFileSync(chunkPath, chunk.buffer);
 
-        for (const file of files) {
-            const filePath = path.join(targetPath, file.originalname);
+        // If all chunks are uploaded, combine them
+        if (parseInt(currentChunk) >= parseInt(totalChunks)) {
+            await FileService.combineChunks(chunkDir, uploadDir, relativeUploadDir, fileName, userId, folderId);
+        }
+    }
 
-            // Move the file to the target path
-            fs.writeFileSync(filePath, file.buffer);
-
-            // Save file metadata to the database
-            const fileRecord = new File({
-                name: file.originalname,
-                path: path.join(fileDbPath, file.originalname), // Store relative path in DB
-                parent_id: parentId ? parentId : null,
-                size: file.size,
-                mimetype: file.mimetype,
-                createdAt: new Date(),
-                deleted: false,
-                userId: userId
+    static async combineChunks(chunkDir, uploadDir, relativeUploadDir, filename, userId, parentId) {
+        try {
+            const targetPath = path.join(uploadDir, filename);
+            const chunks = fs.readdirSync(chunkDir).sort((a, b) => {
+                const aNum = parseInt(a.split('_')[1]);
+                const bNum = parseInt(b.split('_')[1]);
+                return aNum - bNum;
             });
-            await fileRecord.save();
 
-            results.push({ name: file.originalname, path: fileRecord.path });
+            // Create write stream for the target file
+            const writeStream = fs.createWriteStream(targetPath);
+
+            for (const chunk of chunks) {
+                const chunkPath = path.join(chunkDir, chunk);
+                const chunkData = fs.readFileSync(chunkPath);
+                writeStream.write(chunkData);
+                fs.unlinkSync(chunkPath); // Remove chunk after appending
+            }
+
+            writeStream.end();
+
+            await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream);
+
+            // Remove the chunks directory
+            fs.rmdirSync(chunkDir);
+
+            console.log(`File ${filename} successfully combined and saved.`);
+        } catch (error) {
+            console.error('Error combining chunks:', error);
+            throw new Error('Failed to combine file chunks');
         }
-
-        return results;
     }
 
     // Method to calculate the size of a folder recursively
@@ -324,7 +391,7 @@ class FileService {
         return newFolder;
     }
 
-    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null) {
+    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null) {
         if (!folder) {
             folder = '';
         }
@@ -344,6 +411,7 @@ class FileService {
         return new Promise((resolve, reject) => {
             const output = fs.createWriteStream(zipFilePath);
             const archive = archiver('zip', { zlib: { level: 9 } });
+            let processedFiles = 0;
 
             output.on('close', async () => {
                 try {
@@ -375,6 +443,13 @@ class FileService {
                 reject(new Error('Failed to compress files: ' + err.message));
             });
 
+            archive.on('progress', (progressData) => {
+                if (progressCallback && typeof progressCallback === 'function') {
+                    const progress = Math.round((processedFiles / items.length) * 100);
+                    progressCallback(progress);
+                }
+            });
+
             archive.pipe(output);
 
             items.forEach(item => {
@@ -386,6 +461,7 @@ class FileService {
                     archive.file(itemPath, { name: item });
                     fileCount++;
                 }
+                processedFiles++;
             });
 
             archive.finalize();
@@ -475,6 +551,39 @@ class FileService {
                 }
             }
         }
+    }
+
+    static async saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream)
+    {
+        return new Promise((resolve, reject) => {
+            writeStream.on('finish', async () => {
+                await fs.stat(targetPath, async (err, stats) => {
+                    if (err) {
+                        console.error('Error fetching file stats:', err);
+                        reject(err);
+                    } else {
+                        // Save metadata to the database
+                        // const stats = fs.statSync(targetPath);
+                        const mimeType = mime.getType(targetPath);
+
+                        const file = new File({
+                            userId,
+                            name: filename,
+                            parent_id: parentId,
+                            path: path.join(relativeUploadDir, filename),
+                            size: stats.size,
+                            mimetype: mimeType,
+                            createdAt: new Date(),
+                            deleted: false,
+                        });
+
+                        await file.save();
+
+                        resolve(file);
+                    }
+                });
+            });
+        });
     }
 
     static async renameItem(userId, itemId, newName, isFolder) {

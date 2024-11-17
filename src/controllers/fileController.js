@@ -1,22 +1,43 @@
 const FileService = require('../services/fileService');
 const path = require('path');
 const fs = require('fs');
+const { getIO } = require('../socket');
 
 // Upload file
+// exports.uploadFiles = async (req, res) => {
+//     try {
+//         const folder_id = req.body.folder_id || ''; // Retrieve folder path from request body (defaults to root)
+//         const files = req.files; // Access uploaded files
+//
+//         if (!files || files.length === 0) {
+//             return res.status(400).json({ error: 'No files uploaded' });
+//         }
+//
+//         const results = await FileService.uploadFiles(req.userId, files, folder_id); // Pass files and target folder to the service
+//         res.status(200).json({ message: 'Files uploaded successfully', results });
+//     } catch (error) {
+//         console.error('Error uploading files:', error);
+//         res.status(500).json({ error: 'File upload failed' });
+//     }
+// };
+
 exports.uploadFiles = async (req, res) => {
     try {
-        const folder_id = req.body.folder_id || ''; // Retrieve folder path from request body (defaults to root)
-        const files = req.files; // Access uploaded files
+        const { filename, currentChunk, totalChunks, folderId } = req.body;
+        const chunk = req.file; // Assuming you're using multer or similar middleware
 
-        if (!files || files.length === 0) {
-            return res.status(400).json({ error: 'No files uploaded' });
+        if (!filename || currentChunk == null || totalChunks == null || !chunk) {
+            return res.status(400).json({ error: 'Missing required parameters or file chunk' });
         }
 
-        const results = await FileService.uploadFiles(req.userId, files, folder_id); // Pass files and target folder to the service
-        res.status(200).json({ message: 'Files uploaded successfully', results });
+        const userId = req.userId; // Assuming userId is attached by middleware
+
+        await FileService.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
+
+        return res.status(200).json({ message: 'Chunk uploaded successfully' });
     } catch (error) {
-        console.error('Error uploading files:', error);
-        res.status(500).json({ error: 'File upload failed' });
+        console.error('Error uploading chunk:', error);
+        return res.status(500).json({ error: 'Failed to upload chunk' });
     }
 };
 
@@ -131,7 +152,13 @@ exports.createFolder = async (req, res) => {
 exports.compressFiles = async (req, res) => {
     try {
         const { items, folder, zipFileName, parentId } = req.body;
-        const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId);
+
+        const progressCallback = (progress) => {
+            const io = getIO();
+            io.to(req.userId).emit('compressionProgress', { progress });
+        };
+
+        const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId, progressCallback);
         res.status(200).json({ message: 'Files compressed successfully', file: compressedFile });
     } catch (error) {
         console.error('Error compressing files:', error);
