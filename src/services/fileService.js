@@ -560,6 +560,14 @@ class FileService {
 
     static async saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream)
     {
+        if (!parentId) {
+            parentId = null;
+        }
+
+        if (!relativeUploadDir) {
+            relativeUploadDir = userId;
+        }
+
         return new Promise((resolve, reject) => {
             writeStream.on('finish', async () => {
                 await fs.stat(targetPath, async (err, stats) => {
@@ -731,8 +739,12 @@ class FileService {
     static async recalculateFolderStats(folderId)
     {
         try {
+            let folder = null;
             // Find the folder by its ID
-            const folder = await Folder.findById(folderId);
+            if (folderId) {
+                folder = await Folder.findById(folderId);
+            }
+
             if (!folder) {
                 return;
             }
