@@ -13,7 +13,9 @@ const {
     renameItem,
     moveItem,
     download,
-    getFileSize
+    getFileSize,
+    getUploadStatus,
+    stopCompression
 } = require('../controllers/fileController');
 
 const multer = require('multer');
@@ -34,5 +36,7 @@ router.post('/rename', renameItem);
 router.post('/move', moveItem);
 router.post('/download', download);
 router.post('/file-size', getFileSize);
+router.get('/upload/status', getUploadStatus);
+router.post('/stop-compression', stopCompression);
 
 module.exports = router;

@@ -3,24 +3,6 @@ const path = require('path');
 const fs = require('fs');
 const { getIO } = require('../socket');
 
-// Upload file
-// exports.uploadFiles = async (req, res) => {
-//     try {
-//         const folder_id = req.body.folder_id || ''; // Retrieve folder path from request body (defaults to root)
-//         const files = req.files; // Access uploaded files
-//
-//         if (!files || files.length === 0) {
-//             return res.status(400).json({ error: 'No files uploaded' });
-//         }
-//
-//         const results = await FileService.uploadFiles(req.userId, files, folder_id); // Pass files and target folder to the service
-//         res.status(200).json({ message: 'Files uploaded successfully', results });
-//     } catch (error) {
-//         console.error('Error uploading files:', error);
-//         res.status(500).json({ error: 'File upload failed' });
-//     }
-// };
-
 exports.uploadFiles = async (req, res) => {
     try {
         const { filename, currentChunk, totalChunks, folderId } = req.body;
@@ -32,9 +14,10 @@ exports.uploadFiles = async (req, res) => {
 
         const userId = req.userId; // Assuming userId is attached by middleware
 
-        await FileService.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
+        // Delegate chunk processing and progress tracking to FileService
+        await FileService.processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks);
 
-        return res.status(200).json({ message: 'Chunk uploaded successfully' });
+        return res.status(200).json({ message: 'Chunk uploaded successfully', currentChunk });
     } catch (error) {
         console.error('Error uploading chunk:', error);
         return res.status(500).json({ error: 'Failed to upload chunk' });
@@ -155,7 +138,7 @@ exports.compressFiles = async (req, res) => {
 
         const progressCallback = (progress) => {
             const io = getIO();
-            io.to(req.userId).emit('compressionProgress', { progress });
+            io.emit('compressionProgress', { progress });
         };
 
         const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId, progressCallback);
@@ -183,6 +166,27 @@ exports.decompressFile = async (req, res) => {
     }
 };
 
+exports.stopCompression = async (req, res) => {
+    try {
+        const { zipFileName, folder, parentId } = req.body;
+
+        if (!zipFileName || !folder) {
+            return res.status(400).json({ error: 'zipFileName and folder are required.' });
+        }
+
+        const stopped = await FileService.stopCompression(req.userId, zipFileName, folder, parentId);
+
+        if (stopped) {
+            res.status(200).json({ message: 'Compression process stopped successfully.' });
+        } else {
+            res.status(404).json({ error: 'No ongoing compression found for the specified file.' });
+        }
+    } catch (error) {
+        console.error('Error stopping compression:', error);
+        res.status(500).json({ error: 'Failed to stop compression.' });
+    }
+};
+
 // Function to delete a single file
 exports.renameItem = async (req, res) => {
     try {
@@ -193,17 +197,35 @@ exports.renameItem = async (req, res) => {
     }
 };
 
+// exports.moveItem = async (req, res) => {
+//     const { itemId, targetFolderId } = req.body;
+//
+//     try {
+//         const result = await FileService.moveItem(itemId, targetFolderId);
+//         res.status(200).json(result);
+//     } catch (error) {
+//         console.error('Error moving item:', error.message);
+//         res.status(500).json({ message: error.message });
+//     }
+// };
+
 exports.moveItem = async (req, res) => {
-    const { itemId, targetFolderId } = req.body;
+    const { itemIds, targetId, isTargetZip } = req.body;
 
     try {
-        const result = await FileService.moveItem(itemId, targetFolderId);
-        res.status(200).json(result);
+        if (isTargetZip) {
+            const result = await FileService.moveItemsIntoZip(req.userId, itemIds, targetId);
+            res.status(200).json({ success: true, message: 'Items moved into ZIP file successfully', result });
+        } else {
+            const result = await FileService.moveItem(itemIds, targetId);
+            res.status(200).json({ success: true, message: 'Items moved successfully', result });
+        }
     } catch (error) {
-        console.error('Error moving item:', error.message);
-        res.status(500).json({ message: error.message });
+        console.error('Error moving items:', error.message);
+        res.status(500).json({ success: false, message: error.message });
     }
 };
+
 
 exports.download = async (req, res) => {
     const filePath = req.body.filePath;
@@ -265,9 +287,32 @@ exports.getFileSize = async (req, res) => {
         }
 
         const stats = fs.statSync(absolutePath);
-        res.json({ fileSize: stats.size });
+        res.json({ success: true, fileSize: stats.size });
     } catch (error) {
         console.error('Error fetching file size:', error.message);
-        res.status(500).send('Failed to retrieve file size.');
+        res.status(500).json({success: false, message: 'Failed to retrieve file size.'});
     }
 };
+
+exports.getUploadStatus = async (req, res) => {
+    const { filename } = req.query;
+
+    try {
+        if (!filename) {
+            return res.status(400).json({ message: 'Filename is required.' });
+        }
+
+        // Query the database or storage system for uploaded chunks
+        const uploadStatus = await FileService.getUploadedChunks(filename, req.userId);
+
+        if (!uploadStatus) {
+            return res.status(404).json({ success: true, message: 'No upload progress found for the specified file.' });
+        }
+
+        res.status(200).json(uploadStatus); // Return the list of uploaded chunks
+    } catch (error) {
+        console.error('Error fetching upload status:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to fetch upload status.' });
+    }
+};
+

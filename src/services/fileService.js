@@ -1,55 +1,18 @@
 const File = require('../models/fileModel');
 const Folder = require('../models/folderModel');
+const UploadProgress = require('../models/uplodPrgress');
 const fs = require('fs-extra');
 const path = require('path');
 const mime = require('mime');
 const archiver = require('archiver');
 const extract = require('extract-zip');
+const { Transform } = require('stream');
+const { AbortController } = require('abort-controller');
+
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
-
-    // static async uploadFiles(userId, files, parentId = null) {
-    //     let folder = null;
-    //
-    //     if (parentId) {
-    //         folder = await Folder.findOne({_id: parentId}).exec();
-    //     }
-    //
-    //     const fileDbPath = folder ? folder.path : userId;
-    //     const targetPath = path.join(this.uploadDirectory, fileDbPath);
-    //
-    //     // Ensure the target folder exists
-    //     if (!fs.existsSync(targetPath)) {
-    //         fs.mkdirSync(targetPath, { recursive: true });
-    //     }
-    //
-    //     const results = [];
-    //
-    //     for (const file of files) {
-    //         const filePath = path.join(targetPath, file.originalname);
-    //
-    //         // Move the file to the target path
-    //         fs.writeFileSync(filePath, file.buffer);
-    //
-    //         // Save file metadata to the database
-    //         const fileRecord = new File({
-    //             name: file.originalname,
-    //             path: path.join(fileDbPath, file.originalname), // Store relative path in DB
-    //             parent_id: parentId ? parentId : null,
-    //             size: file.size,
-    //             mimetype: file.mimetype,
-    //             createdAt: new Date(),
-    //             deleted: false,
-    //             userId: userId
-    //         });
-    //         await fileRecord.save();
-    //
-    //         results.push({ name: file.originalname, path: fileRecord.path });
-    //     }
-    //
-    //     return results;
-    // }
+    static ongoingCompressions = new Map();
 
     static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks)
     {
@@ -403,6 +366,28 @@ class FileService {
             folder = '';
         }
 
+        if (!parentId) {
+            parentId = null;
+        }
+
+        const key = `${userId}-${zipFileName}`;
+        const abortController = new AbortController();
+        this.ongoingCompressions.set(key, { abortController, activeArchive: null, output: null });
+
+        const signal = abortController.signal;
+        let output, archive;
+
+        signal.addEventListener('abort', () => {
+            console.log(`Aborting compression for ${zipFileName}.`);
+            archive.abort();
+            if (output) {
+                output.destroy();
+                fs.unlink(zipFilePath, (err) => {
+                    if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
+                });
+            }
+        });
+
         const timestamp = Date.now();
         const name = zipFileName || `compressed_${timestamp}.zip`; // Use provided name or default
         const targetFolder = path.join(this.uploadDirectory, userId, folder);
@@ -412,10 +397,23 @@ class FileService {
             throw new Error("The specified folder doesn't exist.");
         }
 
-        return new Promise((resolve, reject) => {
-            const output = fs.createWriteStream(zipFilePath);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-            let processedFiles = 0;
+        return new Promise(async (resolve, reject) => {
+            output = fs.createWriteStream(zipFilePath);
+            archive = archiver('zip', { zlib: { level: 9 } });
+            this.ongoingCompressions.get(key).activeArchive = archive;
+            this.ongoingCompressions.get(key).output = output;
+            // let processedFiles = 0;
+            let totalBytes = 0;
+            let processedBytes = 0;
+
+            signal.addEventListener('abort', () => {
+                console.log(`Compression for ${zipFileName} aborted.`);
+                archive.abort(); // Abort archiving
+                output.destroy(); // Forcefully close the output stream
+                fs.unlink(zipFilePath, (err) => {
+                    if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
+                });
+            });
 
             output.on('close', async () => {
                 try {
@@ -436,9 +434,13 @@ class FileService {
                     await compressedFile.save();
 
                     resolve(compressedFile);
-                } catch (err) {
-                    console.error('Error saving metadata:', err); // Log the specific error
-                    reject(new Error('Failed to save compressed file metadata: ' + err.message));
+                } catch (error) {
+                    if (signal.aborted) {
+                        console.log(`Compression for ${zipFileName} was aborted successfully.`);
+                    } else {
+                        console.error('Error saving metadata:', error);
+                    }
+                    reject(new Error('Failed to save compressed file metadata: ' + error.message));
                 }
             });
 
@@ -447,26 +449,72 @@ class FileService {
                 reject(new Error('Failed to compress files: ' + err.message));
             });
 
-            archive.on('progress', (progressData) => {
+            archive.on('error', (err) => {
+                console.error('Archive error:', err);
+                reject(new Error('Archive error: ' + err.message));
+            });
+
+            // archive.on('progress', (progressData) => {
+                // if (progressCallback && typeof progressCallback === 'function') {
+                //     if (!totalBytes) {
+                //         // Calculate total bytes once, using the total size of all items
+                //         totalBytes = items.reduce((sum, item) => {
+                //             const itemPath = path.join(this.uploadDirectory, userId, item);
+                //             return sum + fs.statSync(itemPath).size;
+                //         }, 0);
+                //     }
+                //
+                //     // Calculate progress based on compressed bytes
+                //     const compressedBytes = progressData.fs.processedBytes;
+                //     const progress = Math.round((compressedBytes / totalBytes) * 100);
+                //     // const progress = Math.round((progressData.entries.processed / items.length) * 100);
+                //     progressCallback(progress);
+                // }
+            // });
+
+            // Calculate total bytes for all items
+            totalBytes = items.reduce((sum, item) => {
+                const itemPath = path.join(this.uploadDirectory, userId, item);
+                return sum + fs.statSync(itemPath).size;
+            }, 0);
+
+            // Listen for 'data' event to track compressed bytes
+            archive.on('data', (chunk) => {
+                processedBytes += chunk.length;
+                const progress = Math.round((processedBytes / totalBytes) * 100);
                 if (progressCallback && typeof progressCallback === 'function') {
-                    const progress = Math.round((processedFiles / items.length) * 100);
                     progressCallback(progress);
                 }
             });
 
             archive.pipe(output);
 
-            items.forEach(item => {
+            // items.forEach(item => {
+            //     const itemPath = path.join(this.uploadDirectory, userId, item);
+            //     if (fs.statSync(itemPath).isDirectory()) {
+            //         archive.directory(itemPath, item);
+            //     } else {
+            //         archive.file(itemPath, { name: item });
+            //     }
+            //     processedFiles++;
+            // });
+
+            items.forEach((item) => {
+                if (signal.aborted) {
+                    console.log('Aborting compression process...');
+                    throw new Error('Compression process aborted');
+                }
                 const itemPath = path.join(this.uploadDirectory, userId, item);
                 if (fs.statSync(itemPath).isDirectory()) {
                     archive.directory(itemPath, item);
                 } else {
                     archive.file(itemPath, { name: item });
                 }
-                processedFiles++;
             });
 
-            archive.finalize();
+            await archive.finalize();
+
+            this.ongoingCompressions.delete(key);
 
             this.recalculateFolderStats(parentId);
         });
@@ -495,6 +543,30 @@ class FileService {
 
         await this.saveExtractedContentsInDb(rootDir, extractionDir, userId, parentId);
         return absoluteDestination;
+    }
+
+    static async stopCompression(userId, zipFileName) {
+        const key = `${userId}-${zipFileName}`;
+        const compression = this.ongoingCompressions.get(key);
+
+        if (compression) {
+            const { abortController, archive } = compression;
+
+            if (archive) {
+                archive.abort(); // Stop the archiver process
+            }
+
+            if (abortController) {
+                abortController.abort(); // Signal other components to stop
+            }
+
+            this.ongoingCompressions.delete(key);
+            console.log(`Stopped compression for ${zipFileName}.`);
+            return true;
+        }
+
+        console.log(`No ongoing compression found for ${zipFileName}.`);
+        return false;
     }
 
     static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentFolderId = null) {
@@ -721,10 +793,71 @@ class FileService {
                 }
             }
 
+            this.recalculateFolderStats(targetFolderId);
+
             return { message: 'Item moved successfully' };
         } catch (error) {
             console.error('Error moving item:', error.message);
             throw new Error('Failed to move item');
+        }
+    }
+
+    static async moveItemsIntoZip(userId, itemIds, zipFileId) {
+        try {
+            const zipFile = await File.findOne({ _id: zipFileId, userId, deleted: false });
+            if (!zipFile || zipFile.mimetype !== 'application/zip') {
+                throw new Error('Target file is not a valid ZIP file.');
+            }
+
+            const zipFilePath = path.join(this.uploadDirectory, zipFile.path);
+
+            // Temporary directory for extracting and modifying ZIP content
+            const tmpDir = path.join(this.uploadDirectory, 'tmp', `${Date.now()}_${zipFileId}`);
+            fs.mkdirSync(tmpDir, { recursive: true });
+
+            // Extract existing ZIP contents
+            await extract(zipFilePath, { dir: tmpDir });
+
+            for (const itemId of itemIds) {
+                const item = await File.findOne({ _id: itemId, userId, deleted: false });
+
+                if (!item) {
+                    console.warn(`Item with ID ${itemId} not found. Skipping.`);
+                    continue;
+                }
+
+                const itemPath = path.join(this.uploadDirectory, item.path);
+                const targetPath = path.join(tmpDir, item.name);
+
+                if (fs.existsSync(itemPath)) {
+                    // Copy the file into the extracted content
+                    fs.copySync(itemPath, targetPath);
+
+                    // Remove the original file after successful addition
+                    fs.unlinkSync(itemPath);
+
+                    // Remove file entry from the database
+                    await File.deleteOne({ _id: itemId });
+                } else {
+                    console.warn(`Item path ${itemPath} does not exist on disk. Skipping.`);
+                }
+            }
+
+            // Recreate the ZIP file
+            const output = fs.createWriteStream(zipFilePath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+
+            archive.pipe(output);
+            archive.directory(tmpDir, false);
+            await archive.finalize();
+
+            // Clean up temporary directory
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+
+            return { message: 'Items moved into ZIP file successfully' };
+        } catch (error) {
+            console.error('Error moving items into ZIP file:', error.message);
+            throw new Error('Failed to move items into ZIP file');
         }
     }
 
@@ -794,6 +927,45 @@ class FileService {
         } catch (error) {
             console.error(`Error recalculating folder stats: ${error.message}`);
             throw error;
+        }
+    }
+
+    static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
+        try {
+            // Process the uploaded chunk (store to disk or database)
+            await this.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
+
+            // Track uploaded chunk progress
+            const chunkIndex = parseInt(currentChunk, 10);
+            let uploadProgress = await UploadProgress.findOne({ filename, userId });
+
+            if (!uploadProgress) {
+                uploadProgress = new UploadProgress({ userId, filename, uploadedChunks: [] });
+            }
+
+            if (!uploadProgress.uploadedChunks.includes(chunkIndex)) {
+                uploadProgress.uploadedChunks.push(chunkIndex);
+                await uploadProgress.save();
+            }
+        } catch (error) {
+            console.error('Error processing chunk or tracking progress:', error.message);
+            throw new Error('Failed to process chunk or track progress');
+        }
+    }
+
+    static async getUploadedChunks(filename, userId) {
+        try {
+            // Fetch upload progress from the database or storage system
+            const uploadProgress = await UploadProgress.findOne({ filename, userId });
+
+            if (!uploadProgress) {
+                return null; // No progress found for the file
+            }
+
+            return uploadProgress.uploadedChunks; // Return the list of uploaded chunks
+        } catch (error) {
+            console.error('Error retrieving uploaded chunks:', error.message);
+            throw new Error('Failed to retrieve upload progress.');
         }
     }
 }
