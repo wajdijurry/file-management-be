@@ -83,19 +83,55 @@ class FileService {
     }
 
     // Method to calculate the size of a folder recursively
+    // static calculateFolderSize(folderPath) {
+    //     let totalSize = 0;
+    //
+    //     const items = fs.readdirSync(folderPath);
+    //     items.forEach(item => {
+    //         const itemPath = path.join(folderPath, item);
+    //         const stats = fs.statSync(itemPath);
+    //
+    //         if (stats.isDirectory()) {
+    //             // Recursively calculate the size of subdirectories
+    //             totalSize += FileService.calculateFolderSize(itemPath);
+    //         } else {
+    //             // Add the size of the file
+    //             totalSize += stats.size;
+    //         }
+    //     });
+    //
+    //     return totalSize;
+    // }
+
     static calculateFolderSize(folderPath) {
         let totalSize = 0;
 
         const items = fs.readdirSync(folderPath);
-        items.forEach(item => {
+        items.forEach((item) => {
             const itemPath = path.join(folderPath, item);
             const stats = fs.statSync(itemPath);
 
             if (stats.isDirectory()) {
-                // Recursively calculate the size of subdirectories
-                totalSize += FileService.calculateFolderSize(itemPath);
+                totalSize += this.calculateFolderSize(itemPath);
             } else {
-                // Add the size of the file
+                totalSize += stats.size;
+            }
+        });
+
+        return totalSize;
+    }
+
+    static calculateTotalSize(items, userId) {
+        let totalSize = 0;
+
+        items.forEach((item) => {
+            const itemPath = path.join(this.uploadDirectory, userId, item);
+            const stats = fs.statSync(itemPath);
+
+            if (stats.isDirectory()) {
+                // If the item is a folder, calculate the size of its contents recursively
+                totalSize += this.calculateFolderSize(itemPath);
+            } else {
                 totalSize += stats.size;
             }
         });
@@ -403,7 +439,7 @@ class FileService {
             this.ongoingCompressions.get(key).activeArchive = archive;
             this.ongoingCompressions.get(key).output = output;
             // let processedFiles = 0;
-            let totalBytes = 0;
+            // let totalBytes = 0;
             let processedBytes = 0;
 
             signal.addEventListener('abort', () => {
@@ -473,16 +509,13 @@ class FileService {
             // });
 
             // Calculate total bytes for all items
-            totalBytes = items.reduce((sum, item) => {
-                const itemPath = path.join(this.uploadDirectory, userId, item);
-                return sum + fs.statSync(itemPath).size;
-            }, 0);
+            let totalSize = this.calculateTotalSize(items, userId);
 
             // Listen for 'data' event to track compressed bytes
             archive.on('data', (chunk) => {
                 processedBytes += chunk.length;
-                const progress = Math.round((processedBytes / totalBytes) * 100);
                 if (progressCallback && typeof progressCallback === 'function') {
+                    const progress = Math.round((processedBytes / totalSize) * 100);
                     progressCallback(progress);
                 }
             });
@@ -520,29 +553,202 @@ class FileService {
         });
     }
 
-    static async decompressFile(userId, zipFilePath, destinationFolder = '.', merge = false, parentId = null) {
-        // Define the root directory
-        const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
-        const absoluteDestination = path.resolve(rootDir, destinationFolder);
-        const extractionDir = absoluteDestination;
-        zipFilePath = path.join(this.uploadDirectory, zipFilePath);
+    static async decompressFileWithConflictHandling(userId, filePath, destinationFolder, parentId, merge, conflictCallback) {
+        try {
+            const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+            const absoluteDestination = path.resolve(rootDir, destinationFolder);
+            const zipFileAbsolutePath = path.resolve(rootDir, filePath);
 
-        // Prevent directory traversal attack
-        if (!absoluteDestination.startsWith(rootDir)) {
-            throw new Error('Invalid destination folder. Directory traversal is not allowed.');
+            // Prevent directory traversal attack
+            if (!absoluteDestination.startsWith(rootDir) || !zipFileAbsolutePath.startsWith(rootDir)) {
+                throw new Error('Invalid filePath or destination folder. Directory traversal is not allowed.');
+            }
+
+            // Ensure the ZIP file exists
+            if (!fs.existsSync(zipFileAbsolutePath)) {
+                throw new Error('ZIP file does not exist.');
+            }
+
+            // Create a temporary extraction folder
+            const tmpExtractionDir = path.join(this.uploadDirectory, 'tmp', `${Date.now()}_decompress`);
+            fs.mkdirSync(tmpExtractionDir, { recursive: true });
+
+            try {
+                // Extract ZIP contents into the temporary directory
+                await extract(zipFileAbsolutePath, { dir: tmpExtractionDir });
+
+                // Read extracted items
+                const extractedItems = fs.readdirSync(tmpExtractionDir);
+
+                for (const item of extractedItems) {
+                    const destItemPath = path.join(absoluteDestination, item);
+
+                    if (fs.existsSync(destItemPath) && !merge) {
+                        // Trigger conflict callback for user decision
+                        const userDecision = await conflictCallback(item, destItemPath);
+
+                        if (!userDecision) {
+                            console.log(`Skipping conflicting item: ${item}`);
+                            continue; // Skip the conflicting item
+                        }
+                    }
+
+                    // Move or merge the file/folder
+                    const sourceItemPath = path.join(tmpExtractionDir, item);
+                    fs.renameSync(sourceItemPath, destItemPath);
+                }
+
+                // Clean up temporary directory
+                fs.rmSync(tmpExtractionDir, { recursive: true, force: true });
+
+                return { success: true, message: 'Decompression completed successfully.' };
+            } catch (error) {
+                console.error('Error during decompression:', error);
+                throw new Error('Failed to decompress the file.');
+            }
+        } catch (error) {
+            console.error('Error decompressing file:', error);
+            throw error;
         }
+    }
 
-        // Ensure the destination folder exists or create it
-        if (!merge) {
-            fs.rmSync(absoluteDestination, { recursive: true, force: true });
+    // static async decompressFile(userId, zipFilePath, destinationFolder = '.', merge = false, parentId = null) {
+    //
+    //     // Define the root directory
+    //     const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+    //     const absoluteDestination = path.resolve(rootDir, destinationFolder);
+    //     const extractionDir = absoluteDestination;
+    //     zipFilePath = path.join(this.uploadDirectory, zipFilePath);
+    //
+    //     // Prevent directory traversal attack
+    //     if (!absoluteDestination.startsWith(rootDir)) {
+    //         throw new Error('Invalid destination folder. Directory traversal is not allowed.');
+    //     }
+    //
+    //     // Ensure the destination folder exists or create it
+    //     if (!merge) {
+    //         fs.rmSync(absoluteDestination, { recursive: true, force: true });
+    //     }
+    //     fs.mkdirSync(extractionDir, { recursive: true });
+    //
+    //     // Extract the ZIP file
+    //     await extract(zipFilePath, { dir: extractionDir });
+    //
+    //     await this.saveExtractedContentsInDb(rootDir, extractionDir, userId, parentId);
+    //     return absoluteDestination;
+    // }
+
+    static async decompressFile(userId, filePath, destinationFolder, parentId, merge, conflictCallback) {
+        try {
+            const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+            const absoluteDestination = path.resolve(rootDir, destinationFolder);
+            const zipFileAbsolutePath = path.resolve(rootDir, filePath);
+
+            // Prevent directory traversal attacks
+            if (!absoluteDestination.startsWith(rootDir) || !zipFileAbsolutePath.startsWith(rootDir)) {
+                throw new Error('Invalid filePath or destination folder. Directory traversal is not allowed.');
+            }
+
+            // Ensure the ZIP file exists
+            if (!fs.existsSync(zipFileAbsolutePath)) {
+                throw new Error('ZIP file does not exist.');
+            }
+
+            // Create a temporary extraction folder
+            const tmpExtractionDir = path.join(this.uploadDirectory, 'tmp', `${Date.now()}_decompress`);
+            fs.mkdirSync(tmpExtractionDir, { recursive: true });
+
+            try {
+                // Extract ZIP contents into the temporary directory
+                await extract(zipFileAbsolutePath, { dir: tmpExtractionDir });
+
+                // Read extracted items and process them one by one
+                const extractedItems = fs.readdirSync(tmpExtractionDir);
+
+                for (const item of extractedItems) {
+                    const sourceItemPath = path.join(tmpExtractionDir, item);
+                    const destItemPath = path.join(absoluteDestination, item);
+
+                    // Check for conflict
+                    if (fs.existsSync(destItemPath) && !merge) {
+                        console.log('conflict detected');
+                        const userDecision = await conflictCallback(item, destItemPath);
+
+                        if (!userDecision) {
+                            console.log(`Skipping conflicting item: ${item}`);
+                            continue; // Skip the conflicting item
+                        }
+                    }
+
+                    // Move the file or folder to the destination
+                    fs.renameSync(sourceItemPath, destItemPath);
+                }
+
+                // Clean up temporary directory
+                fs.rmSync(tmpExtractionDir, { recursive: true, force: true });
+
+                return { success: true, message: 'Decompression completed successfully.' };
+            } catch (error) {
+                console.error('Error during decompression:', error);
+                throw new Error('Failed to decompress the file.');
+            }
+        } catch (error) {
+            console.error('Error decompressing file:', error);
+            throw error;
         }
-        fs.mkdirSync(extractionDir, { recursive: true });
+    }
 
-        // Extract the ZIP file
-        await extract(zipFilePath, { dir: extractionDir });
+    static async checkDecompressionConflicts(userId, filePath, destinationFolder) {
+        try {
+            const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+            const absoluteDestination = path.resolve(rootDir, destinationFolder);
+            const zipFileAbsolutePath = path.resolve(rootDir, filePath);
 
-        await this.saveExtractedContentsInDb(rootDir, extractionDir, userId, parentId);
-        return absoluteDestination;
+            // Prevent directory traversal attacks
+            if (!absoluteDestination.startsWith(rootDir) || !zipFileAbsolutePath.startsWith(rootDir)) {
+                throw new Error('Invalid filePath or destination folder. Directory traversal is not allowed.');
+            }
+
+            // Ensure the ZIP file exists
+            if (!fs.existsSync(zipFileAbsolutePath)) {
+                throw new Error('ZIP file does not exist.');
+            }
+
+            // Create a temporary extraction folder
+            const tmpExtractionDir = path.join(this.uploadDirectory, 'tmp', `${Date.now()}_decompress`);
+            fs.mkdirSync(tmpExtractionDir, { recursive: true });
+
+            try {
+                // Extract ZIP contents into the temporary directory
+                await extract(zipFileAbsolutePath, { dir: tmpExtractionDir });
+
+                // Read extracted items and check for conflicts
+                const extractedItems = fs.readdirSync(tmpExtractionDir);
+                const conflicts = [];
+
+                for (const item of extractedItems) {
+                    const destItemPath = path.join(absoluteDestination, item);
+
+                    if (fs.existsSync(destItemPath)) {
+                        conflicts.push({
+                            name: item,
+                            type: fs.statSync(destItemPath).isDirectory() ? 'folder' : 'file'
+                        });
+                    }
+                }
+
+                // Clean up temporary directory
+                fs.rmSync(tmpExtractionDir, { recursive: true, force: true });
+
+                return { conflicts };
+            } catch (error) {
+                console.error('Error during conflict checking:', error);
+                throw new Error('Failed to check for decompression conflicts.');
+            }
+        } catch (error) {
+            console.error('Error checking decompression conflicts:', error);
+            throw error;
+        }
     }
 
     static async stopCompression(userId, zipFileName) {

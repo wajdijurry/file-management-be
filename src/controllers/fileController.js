@@ -149,22 +149,73 @@ exports.compressFiles = async (req, res) => {
     }
 };
 
+// exports.decompressFile = async (req, res) => {
+//     try {
+//         const { filePath, targetFolder, merge, parentId } = req.body;
+//
+//         if (!filePath || !targetFolder) {
+//             return res.status(400).json({ error: 'filePath and targetFolder are required' });
+//         }
+//
+//         console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
+//         const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
+//         res.status(200).json(result);
+//     } catch (error) {
+//         console.error('Error decompressing file:', error);
+//         res.status(500).json({ error: error.message });
+//     }
+// };
+
 exports.decompressFile = async (req, res) => {
     try {
-        const { filePath, targetFolder, merge, parentId } = req.body;
+        const { filePath, targetFolder, parentId, merge } = req.body;
 
         if (!filePath || !targetFolder) {
-            return res.status(400).json({ error: 'filePath and targetFolder are required' });
+            return res.status(400).json({ error: 'filePath and targetFolder are required.' });
         }
 
-        console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
-        res.status(200).json(result);
+        console.log(`Decompressing ${filePath} into ${targetFolder} with merge=${merge}`);
+
+        const conflictCallback = async (item, destPath) => {
+            res.write(JSON.stringify({ conflict: { name: item, path: destPath } }) + '\n');
+            return new Promise((resolve) => {
+                req.once('continueDecompression', (decision) => resolve(decision));
+            });
+        };
+
+        const result = await FileService.decompressFileWithConflictHandling(
+            req.userId,
+            filePath,
+            targetFolder,
+            parentId,
+            merge,
+            conflictCallback
+        );
+
+        res.end(JSON.stringify(result)); // Ensure response is terminated
     } catch (error) {
-        console.error('Error decompressing file:', error);
-        res.status(500).json({ error: error.message });
+        console.error('Error decompressing file:', error.message);
+        res.status(500).json({ error: 'Failed to decompress the file.' });
     }
 };
+
+exports.checkDecompressionConflicts = async (req, res) => {
+    try {
+        const { filePath, targetFolder } = req.body;
+
+        if (!filePath || !targetFolder) {
+            return res.status(400).json({ error: 'filePath and targetFolder are required.' });
+        }
+
+        const result = await FileService.checkDecompressionConflicts(req.userId, filePath, targetFolder);
+
+        res.status(200).json(result);
+    } catch (error) {
+        console.error('Error checking decompression conflicts:', error.message);
+        res.status(500).json({ error: 'Failed to check for decompression conflicts.' });
+    }
+};
+
 
 exports.stopCompression = async (req, res) => {
     try {

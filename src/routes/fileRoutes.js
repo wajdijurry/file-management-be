@@ -15,7 +15,8 @@ const {
     download,
     getFileSize,
     getUploadStatus,
-    stopCompression
+    stopCompression,
+    checkDecompressionConflicts
 } = require('../controllers/fileController');
 
 const multer = require('multer');
@@ -32,6 +33,7 @@ router.get('/view/:fileId', viewFile);
 router.post('/create-folder', createFolder);
 router.post('/compress', compressFiles);
 router.post('/decompress', decompressFile);
+router.post('/check-decompression-conflicts', checkDecompressionConflicts);
 router.post('/rename', renameItem);
 router.post('/move', moveItem);
 router.post('/download', download);
