@@ -2,6 +2,7 @@ const FileService = require('../services/fileService');
 const path = require('path');
 const fs = require('fs');
 const { getIO } = require('../socket');
+const UploadProgress = require("../models/uplodPrgress");
 
 exports.uploadFiles = async (req, res) => {
     try {
@@ -149,92 +150,22 @@ exports.compressFiles = async (req, res) => {
     }
 };
 
-// exports.decompressFile = async (req, res) => {
-//     try {
-//         const { filePath, targetFolder, merge, parentId } = req.body;
-//
-//         if (!filePath || !targetFolder) {
-//             return res.status(400).json({ error: 'filePath and targetFolder are required' });
-//         }
-//
-//         console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-//         const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
-//         res.status(200).json(result);
-//     } catch (error) {
-//         console.error('Error decompressing file:', error);
-//         res.status(500).json({ error: error.message });
-//     }
-// };
-
 exports.decompressFile = async (req, res) => {
     try {
-        const { filePath, targetFolder, parentId, merge } = req.body;
+        const { filePath, targetFolder, merge, parentId } = req.body;
 
         if (!filePath || !targetFolder) {
-            return res.status(400).json({ error: 'filePath and targetFolder are required.' });
+            return res.status(400).json({ error: 'filePath and targetFolder are required' });
         }
 
-        console.log(`Decompressing ${filePath} into ${targetFolder} with merge=${merge}`);
-
-        const conflictCallback = async (item, destPath) => {
-            console.log(`Conflict detected for item: ${item}`);
-            res.write(JSON.stringify({ conflict: { name: item, path: destPath } }) + '\n');
-
-            // Remove previous listeners to avoid memory leaks
-            req.removeAllListeners('continueDecompression');
-
-            return new Promise((resolve) => {
-                const timeout = setTimeout(() => {
-                    console.warn(`Timeout reached for item: ${item}. Defaulting to skip.`);
-                    resolve(false); // Default decision to skip
-                }, 2000); // 10 seconds timeout
-
-                req.once('continueDecompression', (decision) => {
-                    clearTimeout(timeout); // Clear timeout on valid decision
-                    console.log(`Decision received for item ${item}: ${decision}`);
-                    resolve(decision);
-                });
-            });
-        };
-
-        const progressCallback = (processed, total) => {
-            res.write(JSON.stringify({ progress: processed, total }) + '\n');
-        };
-
-        const result = await FileService.decompressFileWithConflictHandling(
-            req.userId,
-            filePath,
-            targetFolder,
-            parentId,
-            merge,
-            conflictCallback,
-            progressCallback
-        );
-
-        res.end(JSON.stringify(result));
-    } catch (error) {
-        console.error('Error decompressing file:', error.message);
-        res.status(500).end(JSON.stringify({ error: 'Failed to decompress the file.' }));
-    }
-};
-
-exports.checkDecompressionConflicts = async (req, res) => {
-    try {
-        const { filePath, targetFolder } = req.body;
-
-        if (!filePath || !targetFolder) {
-            return res.status(400).json({ error: 'filePath and targetFolder are required.' });
-        }
-
-        const result = await FileService.checkDecompressionConflicts(req.userId, filePath, targetFolder);
-
+        console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
+        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
         res.status(200).json(result);
     } catch (error) {
-        console.error('Error checking decompression conflicts:', error.message);
-        res.status(500).json({ error: 'Failed to check for decompression conflicts.' });
+        console.error('Error decompressing file:', error);
+        res.status(500).json({ error: error.message });
     }
 };
-
 
 exports.stopCompression = async (req, res) => {
     try {
