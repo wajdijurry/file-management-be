@@ -177,10 +177,28 @@ exports.decompressFile = async (req, res) => {
         console.log(`Decompressing ${filePath} into ${targetFolder} with merge=${merge}`);
 
         const conflictCallback = async (item, destPath) => {
+            console.log(`Conflict detected for item: ${item}`);
             res.write(JSON.stringify({ conflict: { name: item, path: destPath } }) + '\n');
+
+            // Remove previous listeners to avoid memory leaks
+            req.removeAllListeners('continueDecompression');
+
             return new Promise((resolve) => {
-                req.once('continueDecompression', (decision) => resolve(decision));
+                const timeout = setTimeout(() => {
+                    console.warn(`Timeout reached for item: ${item}. Defaulting to skip.`);
+                    resolve(false); // Default decision to skip
+                }, 2000); // 10 seconds timeout
+
+                req.once('continueDecompression', (decision) => {
+                    clearTimeout(timeout); // Clear timeout on valid decision
+                    console.log(`Decision received for item ${item}: ${decision}`);
+                    resolve(decision);
+                });
             });
+        };
+
+        const progressCallback = (processed, total) => {
+            res.write(JSON.stringify({ progress: processed, total }) + '\n');
         };
 
         const result = await FileService.decompressFileWithConflictHandling(
@@ -189,13 +207,14 @@ exports.decompressFile = async (req, res) => {
             targetFolder,
             parentId,
             merge,
-            conflictCallback
+            conflictCallback,
+            progressCallback
         );
 
-        res.end(JSON.stringify(result)); // Ensure response is terminated
+        res.end(JSON.stringify(result));
     } catch (error) {
         console.error('Error decompressing file:', error.message);
-        res.status(500).json({ error: 'Failed to decompress the file.' });
+        res.status(500).end(JSON.stringify({ error: 'Failed to decompress the file.' }));
     }
 };
 
