@@ -129,7 +129,7 @@ exports.createFolder = async (req, res) => {
         res.status(201).json({ message: 'Folder created successfully' });
     } catch (error) {
         console.error('Error creating folder:', error);
-        res.status(500).json({ error: 'Failed to create folder' });
+        res.status(500).json({ error: `Failed to create folder: ${error.message}` });
     }
 };
 
@@ -159,7 +159,7 @@ exports.decompressFile = async (req, res) => {
         }
 
         console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, merge, parentId);
+        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, parentId);
         res.status(200).json(result);
     } catch (error) {
         console.error('Error decompressing file:', error);
@@ -194,21 +194,9 @@ exports.renameItem = async (req, res) => {
         await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder);
         res.json({ success: true, message: 'File/Folder renamed successfully.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Failed to rename file/folder.' });
+        res.status(500).json({ success: false, message: `Failed to rename file/folder: ${err.message}` });
     }
 };
-
-// exports.moveItem = async (req, res) => {
-//     const { itemId, targetFolderId } = req.body;
-//
-//     try {
-//         const result = await FileService.moveItem(itemId, targetFolderId);
-//         res.status(200).json(result);
-//     } catch (error) {
-//         console.error('Error moving item:', error.message);
-//         res.status(500).json({ message: error.message });
-//     }
-// };
 
 exports.moveItem = async (req, res) => {
     const { itemIds, targetId, isTargetZip } = req.body;
@@ -218,7 +206,7 @@ exports.moveItem = async (req, res) => {
             const result = await FileService.moveItemsIntoZip(req.userId, itemIds, targetId);
             res.status(200).json({ success: true, message: 'Items moved into ZIP file successfully', result });
         } else {
-            const result = await FileService.moveItem(itemIds, targetId);
+            const result = await FileService.moveItems(itemIds, targetId);
             res.status(200).json({ success: true, message: 'Items moved successfully', result });
         }
     } catch (error) {

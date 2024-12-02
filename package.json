@@ -19,6 +19,8 @@
     "multer": "^1.4.2",
     "unzipper": "^0.12.3",
     "socket.io": "^4.8.1",
-    "abort-controller": "^3.0.0"
+    "abort-controller": "^3.0.0",
+    "zip-stream": "^7.0.2",
+    "adm-zip": "^0.5.16"
   }
 }

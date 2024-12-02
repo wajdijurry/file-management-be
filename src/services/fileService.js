@@ -7,6 +7,7 @@ const mime = require('mime');
 const archiver = require('archiver');
 const extract = require('extract-zip');
 const { AbortController } = require('abort-controller');
+const AdmZip = require('adm-zip');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -250,6 +251,24 @@ class FileService {
             foldersDeleted: 0
         };
 
+        // Update database to remove documents recursively
+        const deleteDbRecords = async (parentId) => {
+            // Find all child folders and files
+            const childFiles = await File.find({ parentId, userId, deleted: false });
+            const childFolders = await Folder.find({ parentId, userId, deleted: false });
+
+            for (const file of childFiles) {
+                await File.updateOne({ _id: file._id }, { $set: { deleted: true } });
+                deletionResults.filesDeleted++;
+            }
+
+            for (const folder of childFolders) {
+                await deleteDbRecords(folder._id); // Recursively delete child folder contents
+                await Folder.updateOne({ _id: folder._id }, { $set: { deleted: true } });
+                deletionResults.foldersDeleted++;
+            }
+        };
+
         for (const file of files) {
             if (file.path) { // Ensure the path is defined
                 const filePath = path.join(this.uploadDirectory, file.path);
@@ -270,40 +289,15 @@ class FileService {
         for (const folder of folders) {
             if (folder.path) { // Ensure the path is defined
                 const folderPath = path.join(this.uploadDirectory, folder.path);
-                if (fs.existsSync(folderPath)) {
-                    try {
-                        fs.rmSync(folderPath, { recursive: true, force: true });
-                        console.log(`Folder deleted: ${folderPath}`);
-                        deletionResults.foldersDeleted++;
-                    } catch (error) {
-                        console.error(`Error deleting folder: ${folderPath}, Error: ${error.message}`);
-                    }
+                try {
+                    await this.deleteFolderRecursively(folder._id, userId);
+                } catch (error) {
+                    console.error(`Error deleting folder: ${folderPath}, Error: ${error.message}`);
                 }
             } else {
                 console.warn(`Folder path is undefined for folder ID: ${folder._id}`);
             }
         }
-
-        const deleteDbRecords = async () => {
-            const fileUpdateResult = await File.updateMany(
-                { _id: { $in: ids } },
-                { $set: { deleted: true } }
-            );
-            const folderUpdateResult = await Folder.updateMany(
-                { _id: { $in: ids } },
-                { $set: { deleted: true } }
-            );
-
-            return {
-                filesModified: fileUpdateResult.nModified,
-                foldersModified: folderUpdateResult.nModified
-            };
-        };
-
-        const result = await deleteDbRecords();
-
-        console.log(`Files deleted: ${deletionResults.filesDeleted}, Folders deleted: ${deletionResults.foldersDeleted}`);
-        console.log(`Database - Files modified: ${result.filesModified}, Folders modified: ${result.foldersModified}`);
 
         this.recalculateFolderStats(parentId);
 
@@ -334,8 +328,8 @@ class FileService {
             const fileIds = filesToDelete.map(file => file._id);
 
             // Delete all subfolder and file documents in one go
-            await Folder.deleteMany({ _id: { $in: [folderId, ...subFolderIds] } });
-            await File.deleteMany({ _id: { $in: fileIds } });
+            await Folder.updateMany({ _id: { $in: [folderId, ...subFolderIds] } }, { $set: { deleted: true } });
+            await File.updateMany({ _id: { $in: fileIds } }, { $set: { deleted: true } });
 
             console.log(`Deleted folder ${folderToDelete.name} and its contents.`);
 
@@ -362,6 +356,10 @@ class FileService {
     static async createFolder(userId, folderName, parent_id = null) {
         if (!userId || !folderName) {
             throw new Error('userId and folderName are required');
+        }
+
+        if (folderName.indexOf('..') > -1) {
+            throw new Error('Invalid target folder. Directory traversal is not allowed.');
         }
 
         // Determine the folder's relative path based on parent_id
@@ -552,55 +550,44 @@ class FileService {
         });
     }
 
-    static async decompressFile(userId, zipFilePath, destinationFolder = '.', merge = false, parentId = null) {
-        // Define the root directory
+    static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
         const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
-        const absoluteDestination = path.resolve(rootDir, destinationFolder);
-        const extractionDir = absoluteDestination;
+        let targetDir = targetFolder === '.' ? rootDir : path.join(rootDir, targetFolder);
+        parentId = parentId ? parentId : null;
+
         zipFilePath = path.join(this.uploadDirectory, zipFilePath);
 
         // Prevent directory traversal attack
-        if (!absoluteDestination.startsWith(rootDir)) {
-            throw new Error('Invalid destination folder. Directory traversal is not allowed.');
+        if (!targetDir.startsWith(rootDir)) {
+            throw new Error('Invalid target folder. Directory traversal is not allowed.');
         }
 
-        if (!fs.existsSync(extractionDir)) {
-            console.log('creating folder');
-            fs.mkdirSync(extractionDir, {recursive: true});
+        const isRoot = targetDir === rootDir;
+
+        if (!isRoot) {
+            // Ensure the target directory exists
+            fs.mkdirSync(targetDir, {recursive: true});
         }
 
-        let extractedItems = [];
-
-        // Extract the ZIP file
+        const extractedItems = [];
         await extract(zipFilePath, {
-            dir: extractionDir,
+            dir: targetDir,
             onEntry: async (entry) => {
-                const fullPath = path.join(destinationFolder, entry.fileName);
-                const isDirectory = entry.uncompressedSize === 0 && !path.extname(entry.fileName);
+                const fullPath = path.join(targetDir, entry.fileName);
+                const relativePath = path.relative(rootDir, fullPath);
 
-                if (isDirectory) {
-                    // Ensure directory exists
-                    fs.mkdirSync(fullPath, { recursive: true });
-                } else {
-                    // Ensure the parent directory exists for files
-                    const parentDir = path.dirname(fullPath);
-                    fs.mkdirSync(parentDir, { recursive: true });
+                const parts = relativePath.split('/');
+                const segments = parts.map((_, index) => parts.slice(0, index + 1).join('/'));
+                for (const part of segments) {
+                    extractedItems.push(part);
                 }
-
-                // Add the entry to the extracted items
-                extractedItems.push({
-                    name: entry.fileName,
-                    fullPath,
-                    isDirectory,
-                    size: entry.uncompressedSize || 0,
-                });
-            }
+            },
         });
 
-        // extractedItems = extractedItems.map(entry => entry.fileName);
+        // Save extracted contents
+        await this.saveExtractedContentsInDb(rootDir, targetDir, userId, parentId, isRoot, extractedItems);
 
-        await this.saveExtractedContentsInDb(rootDir, extractionDir, userId, parentId, extractedItems);
-        return absoluteDestination;
+        return path.relative(this.uploadDirectory, targetDir);
     }
 
     static async stopCompression(userId, zipFileName) {
@@ -627,65 +614,78 @@ class FileService {
         return false;
     }
 
-    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentFolderId = null, items = []) {
-        if (rootDir === currentPath) {
-            parentFolderId = null;
-        } else {
-            const relativePath = path.join(userId, path.relative(rootDir, currentPath));
-            // Create a folder document for the current path if it doesn't exist
-            let folderDoc = await Folder.findOne({ path: relativePath, userId, deleted: false });
+    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentFolderId = null, isRoot = false, items = []) {
+        // Calculate the relative path from the root directory
+        const relativeFolderPath = path.relative(rootDir, currentPath);
+        const fullFolderPath = isRoot
+            ? userId // If root, only use the userId as the base path
+            : path.join(userId, relativeFolderPath); // Prefix with userId for non-root folders
+
+        let folderDoc;
+
+        // Only create a folder if it’s not the root or explicitly required
+        if (!isRoot || relativeFolderPath) {
+            folderDoc = await Folder.findOne({ path: fullFolderPath, userId, deleted: false });
+
             if (!folderDoc) {
                 folderDoc = new Folder({
-                    name: path.basename(currentPath),
-                    path: relativePath,
-                    parent_id: parentFolderId,
+                    name: isRoot ? userId : path.basename(currentPath), // Use userId only for root
+                    path: fullFolderPath,
+                    parent_id: isRoot ? null : parentFolderId, // Root has no parent
                     userId,
                 });
                 await folderDoc.save();
             }
+
+            // Update parentFolderId for nested items
             parentFolderId = folderDoc._id;
         }
 
-        console.log(items);
+        if (!isRoot) {
+            // If not root, remove the first item (folder) as it is already created
+            currentPath = currentPath.split('/');
+            currentPath = currentPath.slice(0, currentPath.length - 1).join('/');
+        }
 
         for (const item of items) {
-            const itemPath = path.join(currentPath, item);
-            const stats = fs.statSync(itemPath);
-            const itemRelativePath = path.join(userId, path.relative(rootDir, itemPath));
+            const absoluteItemPath = path.join(currentPath, item);
+            const stats = fs.statSync(absoluteItemPath);
 
             if (stats.isDirectory()) {
-                // Check if folder document already exists
-                let folder = await Folder.findOne({ path: itemRelativePath, userId, deleted: false });
-                if (!folder) {
-                    // Create a folder document if it doesn't exist
-                    folder = new Folder({
-                        name: item,
-                        path: itemRelativePath,
-                        parent_id: parentFolderId,
-                        userId,
-                    });
-                    await folder.save();
-                    this.recalculateFolderStats(folder._id.toString());
-                }
-                const newParentFolderId = folder._id;
-
-                // Recursively create documents for the folder contents
-                await this.saveExtractedContentsInDb(rootDir, itemPath, userId, newParentFolderId);
+                // Recursively handle subdirectories
+                await this.saveExtractedContentsInDb(
+                    rootDir,
+                    absoluteItemPath,
+                    userId,
+                    parentFolderId,
+                    false // Subdirectories are not root
+                );
             } else {
-                // Check if file document already exists
-                let file = await File.findOne({ path: itemRelativePath, userId, deleted: false });
-                if (!file) {
-                    // Create a file document if it doesn't exist
-                    const mimeType = mime.getType(itemPath) || 'application/octet-stream';
-                    file = new File({
-                        name: item,
-                        path: itemRelativePath,
-                        parent_id: parentFolderId,
+                // Handle files
+                const relativeFilePath = path.relative(rootDir, absoluteItemPath);
+                const fullFilePath = path.join(userId, relativeFilePath); // Prefix with userId for full path
+
+                // Get relative folder path and remove file name
+                let folderDbRelativePath = relativeFilePath.split('/');
+                folderDbRelativePath.pop();
+                folderDbRelativePath = path.join(userId, folderDbRelativePath.join('/'));
+
+                folderDoc = await Folder.findOne({ path: folderDbRelativePath, userId, deleted: false });
+
+                // Check or create the file document
+                let fileDoc = await File.findOne({ path: fullFilePath, userId, deleted: false });
+                if (!fileDoc) {
+                    const mimeType = mime.getType(absoluteItemPath) || 'application/octet-stream';
+
+                    fileDoc = new File({
+                        name: path.basename(absoluteItemPath),
+                        path: fullFilePath,
+                        parent_id: folderDoc ? folderDoc._id : parentFolderId,
                         size: stats.size,
                         mimetype: mimeType,
                         userId,
                     });
-                    await file.save();
+                    await fileDoc.save();
                 }
             }
         }
@@ -735,6 +735,10 @@ class FileService {
     static async renameItem(userId, itemId, newName, isFolder) {
         if (!userId || !itemId || !newName) {
             throw new Error('userId, itemId, and newName are required');
+        }
+
+        if (newName.indexOf('..') > -1) {
+            throw new Error('Invalid target folder. Directory traversal is not allowed.');
         }
 
         let item, oldPath, newPath;
@@ -804,62 +808,68 @@ class FileService {
         return `${isFolder ? 'Folder' : 'File'} renamed successfully`;
     }
 
-    static async moveItem(itemId, targetFolderId) {
+    static async moveItems(itemIds, targetFolderId) {
         try {
-            // Find the item to move (file or folder)
-            let item = await File.findById(itemId) || await Folder.findById(itemId);
-            if (!item) {
-                throw new Error('Item not found');
-            }
-
-            // Check if target folder exists and is indeed a folder
+            // Validate the target folder
             const targetFolder = await Folder.findById(targetFolderId);
             if (!targetFolder) {
                 throw new Error('Invalid target folder');
             }
 
-            // Define old and new paths with absolute paths
-            const oldPath = item.path;
-            const newPath = path.join(targetFolder.path, item.name);
-
-            // Use fs-extra's move function to handle moving and directory creation
-            await fs.move(
-                path.join(this.uploadDirectory, oldPath),
-                path.join(this.uploadDirectory, newPath),
-                { overwrite: false }
-            );
-
-            // Update item's `parent_id` and `path` in the database
-            item.parent_id = targetFolderId;
-            item.path = newPath;
-            await item.save();
-
-            // If the item is a folder, update the paths of all child items
-            if (item instanceof Folder) {
-                const oldPathSegment = oldPath;
-                const newPathSegment = newPath;
-
-                // Update paths of child folders
-                const childFolders = await Folder.find({ path: new RegExp(`^${oldPathSegment}/`) });
-                for (const childFolder of childFolders) {
-                    childFolder.path = childFolder.path.replace(oldPathSegment, newPathSegment);
-                    await childFolder.save();
+            for (const itemId of itemIds) {
+                // Find the item to move (file or folder)
+                let item = await File.findById(itemId) || await Folder.findById(itemId);
+                if (!item) {
+                    console.warn(`Item with ID ${itemId} not found. Skipping.`);
+                    continue;
                 }
 
-                // Update paths of child files
-                const childFiles = await File.find({ path: new RegExp(`^${oldPathSegment}/`) });
-                for (const childFile of childFiles) {
-                    childFile.path = childFile.path.replace(oldPathSegment, newPathSegment);
-                    await childFile.save();
+                // Define old and new paths
+                const oldPath = item.path;
+                const newPath = path.join(targetFolder.path, item.name);
+
+                // Move the item on the filesystem
+                await fs.move(
+                    path.join(this.uploadDirectory, oldPath),
+                    path.join(this.uploadDirectory, newPath),
+                    { overwrite: false }
+                );
+
+                // Update item's `parent_id` and `path` in the database
+                item.parent_id = targetFolderId;
+                item.path = newPath;
+                await item.save();
+
+                // If the item is a folder, update the paths of all child items
+                if (item instanceof Folder) {
+                    const oldPathSegment = oldPath;
+                    const newPathSegment = newPath;
+
+                    // Update paths of child folders
+                    const childFolders = await Folder.find({ path: new RegExp(`^${oldPathSegment}/`) });
+                    for (const childFolder of childFolders) {
+                        childFolder.path = childFolder.path.replace(oldPathSegment, newPathSegment);
+                        await childFolder.save();
+                    }
+
+                    // Update paths of child files
+                    const childFiles = await File.find({ path: new RegExp(`^${oldPathSegment}/`) });
+                    for (const childFile of childFiles) {
+                        childFile.path = childFile.path.replace(oldPathSegment, newPathSegment);
+                        await childFile.save();
+                    }
                 }
+
+                console.log(`Moved item: ${item.name}`);
             }
 
-            this.recalculateFolderStats(targetFolderId);
+            // Recalculate stats for the target folder
+            await this.recalculateFolderStats(targetFolderId);
 
-            return { message: 'Item moved successfully' };
+            return { message: 'Items moved successfully' };
         } catch (error) {
-            console.error('Error moving item:', error.message);
-            throw new Error('Failed to move item');
+            console.error('Error moving items:', error.message);
+            throw new Error('Failed to move items');
         }
     }
 
@@ -871,16 +881,27 @@ class FileService {
             }
 
             const zipFilePath = path.join(this.uploadDirectory, zipFile.path);
+            const tmpZipFilePath = `${zipFilePath}.tmp`;
 
-            // Temporary directory for extracting and modifying ZIP content
-            const tmpDir = path.join(this.uploadDirectory, 'tmp', `${Date.now()}_${zipFileId}`);
-            fs.mkdirSync(tmpDir, { recursive: true });
+            const output = fs.createWriteStream(tmpZipFilePath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
 
-            // Extract existing ZIP contents
-            await extract(zipFilePath, { dir: tmpDir });
+            archive.pipe(output);
+
+            console.log('Reading existing ZIP contents...');
+            const existingZip = new AdmZip(zipFilePath);
+            const existingEntries = existingZip.getEntries();
+
+            for (const entry of existingEntries) {
+                if (!entry.isDirectory) {
+                    console.log(`Adding existing ZIP entry: ${entry.entryName}`);
+                    archive.append(existingZip.readFile(entry), { name: entry.entryName });
+                }
+            }
 
             for (const itemId of itemIds) {
-                const item = await File.findOne({ _id: itemId, userId, deleted: false });
+                const item = await File.findOne({ _id: itemId, userId, deleted: false })
+                    || await Folder.findOne({ _id: itemId, userId, deleted: false });
 
                 if (!item) {
                     console.warn(`Item with ID ${itemId} not found. Skipping.`);
@@ -888,38 +909,128 @@ class FileService {
                 }
 
                 const itemPath = path.join(this.uploadDirectory, item.path);
-                const targetPath = path.join(tmpDir, item.name);
 
-                if (fs.existsSync(itemPath)) {
-                    // Copy the file into the extracted content
-                    fs.copySync(itemPath, targetPath);
+                if (!fs.existsSync(itemPath)) {
+                    console.warn(`Item path ${itemPath} does not exist. Skipping.`);
+                    continue;
+                }
 
-                    // Remove the original file after successful addition
-                    fs.unlinkSync(itemPath);
-
-                    // Remove file entry from the database
-                    await File.deleteOne({ _id: itemId });
+                if (fs.statSync(itemPath).isDirectory()) {
+                    console.log(`Adding folder to ZIP: ${item.name}`);
+                    await this.addFolderToArchive(archive, itemPath, item.name);
+                    await this.deleteFolderAndContents(itemId);
                 } else {
-                    console.warn(`Item path ${itemPath} does not exist on disk. Skipping.`);
+                    console.log(`Streaming file to ZIP: ${item.name}`);
+                    try {
+                        const fileStream = fs.createReadStream(itemPath);
+                        archive.append(fileStream, { name: item.name });
+                        console.log(`File successfully queued: ${item.name}`);
+
+                        // Delete the file after it has been added to the archive
+                        fs.unlinkSync(itemPath);
+                    } catch (err) {
+                        console.error(`Error adding file to ZIP: ${err.message}`);
+                    }
                 }
             }
 
-            // Recreate the ZIP file
-            const output = fs.createWriteStream(zipFilePath);
-            const archive = archiver('zip', { zlib: { level: 9 } });
+            console.log('Finalizing archive...');
+            await this.finalizeArchiveWithTimeout(archive, 30000); // 30-second timeout
 
-            archive.pipe(output);
-            archive.directory(tmpDir, false);
-            await archive.finalize();
-
-            // Clean up temporary directory
-            fs.rmSync(tmpDir, { recursive: true, force: true });
+            console.log('Replacing original ZIP file...');
+            fs.renameSync(tmpZipFilePath, zipFilePath);
 
             return { message: 'Items moved into ZIP file successfully' };
         } catch (error) {
             console.error('Error moving items into ZIP file:', error.message);
             throw new Error('Failed to move items into ZIP file');
         }
+    }
+
+    // Helper Method: Add Folder and Its Contents to Archive
+// Helper Method: Add Folder and Its Contents to Archive
+    static async addFolderToArchive(archive, folderPath, folderName) {
+        const items = fs.readdirSync(folderPath);
+
+        for (const item of items) {
+            const itemPath = path.join(folderPath, item);
+
+            if (!fs.existsSync(itemPath)) {
+                console.warn(`Sub-item path ${itemPath} does not exist. Skipping.`);
+                continue;
+            }
+
+            if (fs.statSync(itemPath).isDirectory()) {
+                console.log(`Adding subfolder to ZIP: ${path.join(folderName, item)}`);
+                await this.addFolderToArchive(archive, itemPath, path.join(folderName, item));
+            } else {
+                console.log(`Streaming file to ZIP: ${path.join(folderName, item)}`);
+                try {
+                    const fileStream = fs.createReadStream(itemPath);
+                    archive.append(fileStream, { name: path.join(folderName, item) });
+                } catch (err) {
+                    console.error(`Error adding file to ZIP: ${err.message}`);
+                }
+            }
+        }
+    }
+
+    // Helper Method: Finalize Archive with Timeout
+    static async finalizeArchiveWithTimeout(archive, timeout) {
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                console.error('Finalization timeout exceeded.');
+                reject(new Error('Archive finalization timed out.'));
+            }, timeout);
+
+            archive.on('error', (err) => {
+                clearTimeout(timeoutId);
+                console.error('Error during finalization:', err.message);
+                reject(err);
+            });
+
+            archive.finalize().then(() => {
+                clearTimeout(timeoutId);
+                console.log('Archive finalized successfully.');
+                resolve();
+            }).catch((err) => {
+                clearTimeout(timeoutId);
+                console.error('Finalization failed:', err.message);
+                reject(err);
+            });
+        });
+    }
+
+    // Helper Method: Delete Folder and Its Contents
+    static async deleteFolderAndContents(folderId) {
+        const folder = await Folder.findOne({ _id: folderId, deleted: false });
+        if (!folder) return;
+
+        const folderPath = path.join(this.uploadDirectory, folder.path);
+
+        // Get all files and subfolders inside the folder
+        const files = await File.find({ parent_id: folderId, deleted: false });
+        const subfolders = await Folder.find({ parent_id: folderId, deleted: false });
+
+        // Delete all files in the folder
+        for (const file of files) {
+            const filePath = path.join(this.uploadDirectory, file.path);
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
+            await File.deleteOne({ _id: file._id });
+        }
+
+        // Recursively delete all subfolders
+        for (const subfolder of subfolders) {
+            await this.deleteFolderAndContents(subfolder._id);
+        }
+
+        // Delete the folder itself from disk and database
+        if (fs.existsSync(folderPath)) {
+            fs.rmSync(folderPath, { recursive: true, force: true });
+        }
+        await Folder.deleteOne({ _id: folderId });
     }
 
     static prepareDownload(filePath) {
