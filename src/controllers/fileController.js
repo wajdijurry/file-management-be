@@ -135,14 +135,24 @@ exports.createFolder = async (req, res) => {
 
 exports.compressFiles = async (req, res) => {
     try {
-        const { items, folder, zipFileName, parentId } = req.body;
+        const { items, folder, zipFileName, parentId, archiveType = 'zip', compressionLevel = 6 } = req.body;
 
         const progressCallback = (progress) => {
             const io = getIO();
             io.emit('compressionProgress', { progress });
         };
 
-        const result = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId, progressCallback);
+        const result = await FileService.compressFiles(
+            req.userId,
+            items,
+            folder,
+            zipFileName,
+            parentId,
+            progressCallback,
+            archiveType,
+            compressionLevel
+        );
+
         res.status(200).json({
             success: true,
             message: 'Files compressed successfully',

@@ -144,8 +144,6 @@ class FileService {
             deleted: false
         });
 
-        console.log(parentId, userId,  folderRecords);
-
         // Add hasChildren field to folders
         const foldersWithChildren = await Promise.all(folderRecords.map(async folder => {
             const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
@@ -184,6 +182,7 @@ class FileService {
                     size: folderSize,
                     createdAt: stats.ctime,
                     mimetype: '',
+                    type: 'folder',
                     fileCount: folder.fileCount || 0,
                     folderCount: folder.folderCount || 0,
                     path: folder.path,
@@ -205,6 +204,7 @@ class FileService {
                     size: fileRecord.size,
                     createdAt: fileRecord.createdAt,
                     mimetype: fileRecord.mimetype,
+                    type: fileRecord.mimetype ? fileRecord.mimetype.split('/')[0] : 'unknown',
                     path: fileRecord.path,
                     isLocked: fileRecord.isPasswordProtected && !fileRecord.lastAccessed,
                     password: undefined
@@ -425,197 +425,112 @@ class FileService {
         return newFolder;
     }
 
-    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null) {
-        // Validate items exist and user has access
+    static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null, archiveType = 'zip', compressionLevel = 6) {
         const validatedItems = [];
-        
-        for (const item of items) {
+    
+        // Retrieve paths and validate items from database
+        for (const itemId of items) {
             try {
-                let itemType = item.type?.toLowerCase();
+                let item;
                 let itemPath;
-                let itemName = item.name;
-                let dbPath;
-                
-                if (!itemType || !['file', 'folder'].includes(itemType)) {
-                    // Try to determine type from database
-                    const file = await File.findById(item.id);
-                    if (file && file.userId.toString() === userId) {
-                        itemType = 'file';
-                        dbPath = file.path;
-                        itemName = file.name;
-                    } else {
-                        const folder = await Folder.findById(item.id);
-                        if (folder && folder.userId.toString() === userId) {
-                            itemType = 'folder';
-                            dbPath = folder.path;
-                            itemName = folder.name;
-                        } else {
-                            throw new Error(`Item not found or access denied: ${item.name}`);
-                        }
-                    }
+                let itemType;
+    
+                // Try to find the item as a file first
+                item = await File.findById(itemId);
+                if (item && item.userId.toString() === userId) {
+                    itemType = 'file';
+                    itemPath = path.join(this.uploadDirectory, item.path);
                 } else {
-                    // Type is specified, validate accordingly
-                    if (itemType === 'folder') {
-                        const folder = await Folder.findById(item.id);
-                        if (!folder || folder.userId.toString() !== userId) {
-                            throw new Error(`Folder not found or access denied: ${itemName}`);
-                        }
-                        dbPath = folder.path;
+                    // If not found as file, try as a folder
+                    item = await Folder.findById(itemId);
+                    if (item && item.userId.toString() === userId) {
+                        itemType = 'folder';
+                        itemPath = path.join(this.uploadDirectory, item.path);
                     } else {
-                        const file = await File.findById(item.id);
-                        if (!file || file.userId.toString() !== userId) {
-                            throw new Error(`File not found or access denied: ${itemName}`);
-                        }
-                        dbPath = file.path;
+                        throw new Error(`Item not found or access denied: ${itemId}`);
                     }
                 }
-
-                // Construct full path
-                itemPath = path.join(this.uploadDirectory, dbPath);
-                
-                // Verify path exists
-                if (!fs.existsSync(itemPath)) {
-                    throw new Error(`Path not found for ${itemName}: ${itemPath}`);
-                }
-
+    
+                if (!fs.existsSync(itemPath)) throw new Error(`Path not found: ${itemPath}`);
+    
                 validatedItems.push({
-                    id: item.id,
+                    id: item._id,
                     type: itemType,
-                    name: itemName,
-                    path: dbPath,
-                    fullPath: itemPath
+                    name: item.name,
+                    fullPath: itemPath,
                 });
             } catch (error) {
-                console.error(`Error validating item ${item.name}:`, error);
+                console.error(`Error validating item ${itemId}:`, error);
                 throw error;
             }
         }
-
-        if (!folder) {
-            folder = '';
-            parentId = null;
-        }
-
-        const key = `${userId}-${zipFileName}`;
-        const abortController = new AbortController();
-        this.ongoingCompressions.set(key, { abortController, activeArchive: null, output: null });
-
-        const signal = abortController.signal;
-        let output, archive;
-
-        signal.addEventListener('abort', () => {
-            console.log(`Aborting compression for ${zipFileName}.`);
-            if (archive) archive.abort();
-            if (output) {
-                output.destroy();
-                if (fs.existsSync(zipFilePath)) {
-                    fs.unlink(zipFilePath, (err) => {
-                        if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
-                    });
-                }
-            }
-        });
-
-        const timestamp = Date.now();
-        const name = zipFileName || `compressed_${timestamp}.zip`;
+    
+        const name = zipFileName || `compressed_${Date.now()}.${archiveType}`;
         const targetFolder = path.join(this.uploadDirectory, userId, folder);
-        const zipFilePath = path.join(targetFolder, name);
-
-        if (!fs.existsSync(targetFolder)) {
-            fs.mkdirpSync(targetFolder);
-        }
-
-        return new Promise(async (resolve, reject) => {
-            try {
-                output = fs.createWriteStream(zipFilePath);
-                archive = archiver('zip', { zlib: { level: 9 } });
-                this.ongoingCompressions.get(key).activeArchive = archive;
-                this.ongoingCompressions.get(key).output = output;
-                let processedBytes = 0;
-
-                output.on('close', async () => {
-                    try {
-                        const stats = fs.statSync(zipFilePath);
-                        const compressedFile = new File({
-                            name,
-                            path: path.join(userId, folder, name), // Include userId in the path
-                            size: stats.size,
-                            mimetype: 'application/zip',
-                            createdAt: new Date(),
-                            deleted: false,
-                            userId: userId,
-                            parent_id: parentId
-                        });
-
-                        await compressedFile.save();
-                        resolve({ success: true, file: compressedFile });
-                    } catch (error) {
-                        console.error('Error saving metadata:', error);
-                        reject(new Error('Failed to save compressed file metadata: ' + error.message));
-                    }
-                });
-
-                output.on('error', (err) => {
-                    console.error('Error during compression:', err);
-                    reject(new Error('Failed to compress files: ' + err.message));
-                });
-
-                archive.on('error', (err) => {
-                    console.error('Archive error:', err);
-                    reject(new Error('Archive error: ' + err.message));
-                });
-
-                let totalSize = 0;
-                for (const item of validatedItems) {
-                    if (!fs.existsSync(item.fullPath)) {
-                        throw new Error(`Path not found: ${item.name}`);
-                    }
-                    const stats = fs.statSync(item.fullPath);
-                    if (item.type === 'folder') {
-                        totalSize += this.calculateFolderSize(item.fullPath);
-                    } else {
-                        totalSize += stats.size;
-                    }
-                }
-
-                archive.on('data', (chunk) => {
-                    processedBytes += chunk.length;
-                    if (progressCallback && typeof progressCallback === 'function') {
-                        const progress = Math.round((processedBytes / totalSize) * 100);
-                        progressCallback(progress);
-                    }
-                });
-
-                archive.pipe(output);
-
-                for (const item of validatedItems) {
-                    if (signal.aborted) {
-                        console.log('Aborting compression process...');
-                        throw new Error('Compression process aborted');
-                    }
-
-                    if (item.type === 'folder') {
-                        archive.directory(item.fullPath, item.name);
-                    } else {
-                        archive.file(item.fullPath, { name: item.name });
-                    }
-                }
-
-                await archive.finalize();
-                this.ongoingCompressions.delete(key);
-                await this.recalculateFolderStats(parentId);
-
-            } catch (error) {
-                console.error('Error in compression process:', error);
-                if (output) output.destroy();
-                if (fs.existsSync(zipFilePath)) {
-                    fs.unlink(zipFilePath, () => {});
-                }
-                this.ongoingCompressions.delete(key);
-                reject(error);
+        const archiveFilePath = path.join(targetFolder, name);
+    
+        if (!fs.existsSync(targetFolder)) fs.mkdirSync(targetFolder, { recursive: true });
+    
+        const archiveOptions = archiveType === 'zip' ? { zlib: { level: compressionLevel } } : {};
+        const archiverType = archiveType === '7z' ? '7z' : 'zip';
+    
+        return new Promise((resolve, reject) => {
+            const output = fs.createWriteStream(archiveFilePath);
+            const archive = archiver(archiverType, archiveOptions);
+            let processedBytes = 0;
+            let totalBytes = 0;
+    
+            // Calculate total size for progress
+            for (const item of validatedItems) {
+                const stats = fs.statSync(item.fullPath);
+                totalBytes += item.type === 'folder' ? this.calculateFolderSize(item.fullPath) : stats.size;
             }
+    
+            archive.pipe(output);
+    
+            // Handle progress callback
+            archive.on('data', (chunk) => {
+                processedBytes += chunk.length;
+                if (progressCallback && typeof progressCallback === 'function') {
+                    const progress = Math.round((processedBytes / totalBytes) * 100);
+                    progressCallback(progress);
+                }
+            });
+    
+            output.on('close', async () => {
+                try {
+                    const stats = fs.statSync(archiveFilePath);
+                    const compressedFile = new File({
+                        name,
+                        path: path.join(userId, folder, name),
+                        size: stats.size,
+                        mimetype: `application/${archiveType}`,
+                        createdAt: new Date(),
+                        deleted: false,
+                        userId,
+                        parent_id: parentId,
+                    });
+                    await compressedFile.save();
+                    resolve({ success: true, file: compressedFile });
+                } catch (error) {
+                    reject(new Error(`Failed to save compressed file metadata: ${error.message}`));
+                }
+            });
+    
+            output.on('error', reject);
+            archive.on('error', reject);
+    
+            for (const item of validatedItems) {
+                if (item.type === 'folder') {
+                    archive.directory(item.fullPath, item.name);
+                } else {
+                    archive.file(item.fullPath, { name: item.name });
+                }
+            }
+    
+            archive.finalize();
         });
-    }
+    }    
 
     static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
         const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
@@ -1046,7 +961,7 @@ class FileService {
 
             archive.on('error', (err) => {
                 clearTimeout(timeoutId);
-                console.error('Error during finalization:', err.message);
+                console.error('Error during finalization:', err);
                 reject(err);
             });
 
@@ -1056,7 +971,7 @@ class FileService {
                 resolve();
             }).catch((err) => {
                 clearTimeout(timeoutId);
-                console.error('Finalization failed:', err.message);
+                console.error('Finalization failed:', err);
                 reject(err);
             });
         });
