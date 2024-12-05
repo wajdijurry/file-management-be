@@ -3,7 +3,7 @@ const router = express.Router();
 const {
     uploadFiles,
     getFiles,
-    // downloadFile,
+    downloadFile,
     deleteFile,
     deleteMultipleFiles,
     viewFile,
@@ -15,7 +15,11 @@ const {
     download,
     getFileSize,
     getUploadStatus,
-    stopCompression
+    stopCompression,
+    getFolderTree,
+    setPassword,
+    removePassword,
+    verifyPassword
 } = require('../controllers/fileController');
 
 const multer = require('multer');
@@ -38,5 +42,11 @@ router.post('/download', download);
 router.post('/file-size', getFileSize);
 router.get('/upload/status', getUploadStatus);
 router.post('/stop-compression', stopCompression);
+router.get('/folders/tree', getFolderTree);
+
+// Password protection routes
+router.post('/password/set', setPassword);
+router.post('/password/remove', removePassword);
+router.post('/password/verify', verifyPassword);
 
 module.exports = router;

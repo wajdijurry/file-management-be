@@ -7,6 +7,7 @@ const authRoutes = require('./routes/authRoutes');
 const connectDB = require('./config/db');
 const http = require('http');
 const jwt = require('jsonwebtoken');
+const scheduleAccessTimeout = require('./schedulers/accessTimeoutScheduler');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,22 +24,6 @@ const server = http.createServer(app);
 
 // Initialize Socket.IO
 const io = init(server, corsOptions); // Initialize Socket.IO
-
-
-// Set up WebSocket logic
-// io.on('connection', (socket) => {
-//     console.log('A user connected:', socket.id);
-//
-//     // Example event
-//     socket.on('message', (data) => {
-//         console.log('Message received:', data);
-//         socket.emit('response', 'Message received'); // Echo back
-//     });
-//
-//     socket.on('disconnect', () => {
-//         console.log('A user disconnected:', socket.id);
-//     });
-// });
 
 io.use((socket, next) => {
     const token = socket.handshake.auth.token; // Retrieve the token
@@ -73,18 +58,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Connect to MongoDB
-connectDB();
+connectDB().then(() => {
+    // Start the scheduler after database connection is established
+    scheduleAccessTimeout();
+    
+    // Start the server
+    server.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+    });
+}).catch(err => {
+    console.error('Failed to connect to MongoDB:', err);
+    process.exit(1);
+});
 
 // Routes
 app.use('/api/files', auth, fileRoutes);
 app.use('/api/auth', authRoutes);
-
-// Start the server
-// app.listen(PORT, () => {
-//     console.log(`Server is running on port ${PORT}`);
-// });
-
-// Start the server
-server.listen(PORT, () => { // Use `server.listen` instead of `app.listen`
-    console.log(`Server is running on port ${PORT}`);
-});

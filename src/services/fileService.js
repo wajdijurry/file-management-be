@@ -8,6 +8,7 @@ const archiver = require('archiver');
 const extract = require('extract-zip');
 const { AbortController } = require('abort-controller');
 const AdmZip = require('adm-zip');
+const bcrypt = require('bcrypt');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -82,27 +83,6 @@ class FileService {
         }
     }
 
-    // Method to calculate the size of a folder recursively
-    // static calculateFolderSize(folderPath) {
-    //     let totalSize = 0;
-    //
-    //     const items = fs.readdirSync(folderPath);
-    //     items.forEach(item => {
-    //         const itemPath = path.join(folderPath, item);
-    //         const stats = fs.statSync(itemPath);
-    //
-    //         if (stats.isDirectory()) {
-    //             // Recursively calculate the size of subdirectories
-    //             totalSize += FileService.calculateFolderSize(itemPath);
-    //         } else {
-    //             // Add the size of the file
-    //             totalSize += stats.size;
-    //         }
-    //     });
-    //
-    //     return totalSize;
-    // }
-
     static calculateFolderSize(folderPath) {
         let totalSize = 0;
 
@@ -124,15 +104,32 @@ class FileService {
     static calculateTotalSize(items, userId) {
         let totalSize = 0;
 
-        items.forEach((item) => {
-            const itemPath = path.join(this.uploadDirectory, userId, item);
-            const stats = fs.statSync(itemPath);
+        items.forEach(async (item) => {
+            try {
+                let itemPath;
+                if (item.type === 'folder') {
+                    const folder = await Folder.findById(item.id);
+                    if (!folder || folder.userId.toString() !== userId) {
+                        throw new Error(`Folder not found or access denied: ${item.name}`);
+                    }
+                    itemPath = path.join(this.uploadDirectory, userId, folder.path);
+                } else {
+                    const file = await File.findById(item.id);
+                    if (!file || file.userId.toString() !== userId) {
+                        throw new Error(`File not found or access denied: ${item.name}`);
+                    }
+                    itemPath = path.join(this.uploadDirectory, userId, file.path);
+                }
 
-            if (stats.isDirectory()) {
-                // If the item is a folder, calculate the size of its contents recursively
-                totalSize += this.calculateFolderSize(itemPath);
-            } else {
-                totalSize += stats.size;
+                const stats = fs.statSync(itemPath);
+                if (stats.isDirectory()) {
+                    totalSize += this.calculateFolderSize(itemPath);
+                } else {
+                    totalSize += stats.size;
+                }
+            } catch (error) {
+                console.error(`Error calculating size for ${item.name}:`, error);
+                throw error;
             }
         });
 
@@ -145,7 +142,19 @@ class FileService {
             userId: userId,
             parent_id: parentId,
             deleted: false
-        }).exec();
+        });
+
+        console.log(parentId, userId,  folderRecords);
+
+        // Add hasChildren field to folders
+        const foldersWithChildren = await Promise.all(folderRecords.map(async folder => {
+            const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
+                             await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+            return {
+                ...folder.toObject(),
+                hasChildren: childCount > 0
+            };
+        }));
 
         const fileRecords = await File.find({
             userId: userId,
@@ -158,8 +167,8 @@ class FileService {
 
         // Build the response data by fetching folders and files from disk
         const filesAndFolders = await Promise.all([
-            ...folderRecords.map(async folderRecord => {
-                const folderPath = path.join(uploadDirectory, folderRecord.path);
+            ...foldersWithChildren.map(async folder => {
+                const folderPath = path.join(uploadDirectory, folder.path);
                 if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) {
                     return null; // Ignore if the folder does not exist on disk
                 }
@@ -169,15 +178,18 @@ class FileService {
                 const stats = fs.statSync(folderPath);
 
                 return {
-                    _id: folderRecord._id,
-                    name: folderRecord.name,
+                    id: folder._id.toString(),
+                    name: folder.name,
                     isFolder: true,
                     size: folderSize,
                     createdAt: stats.ctime,
                     mimetype: '',
-                    fileCount: folderRecord.fileCount || 0,
-                    folderCount: folderRecord.folderCount || 0,
-                    path: folderRecord.path
+                    fileCount: folder.fileCount || 0,
+                    folderCount: folder.folderCount || 0,
+                    path: folder.path,
+                    hasChildren: folder.hasChildren,
+                    isLocked: folder.isPasswordProtected && !folder.lastAccessed,
+                    password: undefined
                 };
             }),
             ...fileRecords.map(fileRecord => {
@@ -187,13 +199,15 @@ class FileService {
                 }
 
                 return {
-                    _id: fileRecord._id,
+                    id: fileRecord._id.toString(),
                     name: fileRecord.name,
                     isFolder: false,
                     size: fileRecord.size,
                     createdAt: fileRecord.createdAt,
                     mimetype: fileRecord.mimetype,
-                    path: fileRecord.path
+                    path: fileRecord.path,
+                    isLocked: fileRecord.isPasswordProtected && !fileRecord.lastAccessed,
+                    password: undefined
                 };
             })
         ]);
@@ -233,6 +247,11 @@ class FileService {
         if (!file) {
             throw new Error('File not found');
         }
+        const filePath = path.join(this.uploadDirectory, file.path);
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`File physically deleted: ${filePath}`);
+        }
         file.deleted = true; // Assuming you have a 'deleted' field
         await file.save();
 
@@ -248,102 +267,114 @@ class FileService {
 
         const deletionResults = {
             filesDeleted: 0,
-            foldersDeleted: 0
+            foldersDeleted: 0,
+            errors: []
         };
 
-        // Update database to remove documents recursively
-        const deleteDbRecords = async (parentId) => {
-            // Find all child folders and files
-            const childFiles = await File.find({ parentId, userId, deleted: false });
-            const childFolders = await Folder.find({ parentId, userId, deleted: false });
-
-            for (const file of childFiles) {
-                await File.updateOne({ _id: file._id }, { $set: { deleted: true } });
-                deletionResults.filesDeleted++;
-            }
-
-            for (const folder of childFolders) {
-                await deleteDbRecords(folder._id); // Recursively delete child folder contents
-                await Folder.updateOne({ _id: folder._id }, { $set: { deleted: true } });
-                deletionResults.foldersDeleted++;
-            }
-        };
-
+        // Delete files
         for (const file of files) {
-            if (file.path) { // Ensure the path is defined
+            try {
+                if (!file.path) {
+                    console.warn(`File path is undefined for file ID: ${file._id}`);
+                    deletionResults.errors.push(`Invalid path for file: ${file.name}`);
+                    continue;
+                }
+
                 const filePath = path.join(this.uploadDirectory, file.path);
+                
+                // Delete file from filesystem if it exists
                 if (fs.existsSync(filePath)) {
-                    try {
-                        fs.unlinkSync(filePath);
-                        console.log(`File deleted: ${filePath}`);
-                        deletionResults.filesDeleted++;
-                    } catch (error) {
-                        console.error(`Error deleting file: ${filePath}, Error: ${error.message}`);
-                    }
+                    fs.unlinkSync(filePath);
+                    console.log(`File physically deleted: ${filePath}`);
                 }
-            } else {
-                console.warn(`File path is undefined for file ID: ${file._id}`);
+
+                // Mark file as deleted in database
+                await File.updateOne({ _id: file._id }, { $set: { deleted: true } });
+                console.log(`File marked as deleted in DB: ${file.path}`);
+                deletionResults.filesDeleted++;
+            } catch (error) {
+                console.error(`Error deleting file: ${file.path}, Error: ${error.message}`);
+                deletionResults.errors.push(`Failed to delete file: ${file.name}`);
             }
         }
 
+        // Process folders and their contents
         for (const folder of folders) {
-            if (folder.path) { // Ensure the path is defined
-                const folderPath = path.join(this.uploadDirectory, folder.path);
-                try {
-                    await this.deleteFolderRecursively(folder._id, userId);
-                } catch (error) {
-                    console.error(`Error deleting folder: ${folderPath}, Error: ${error.message}`);
+            try {
+                if (!folder.path) {
+                    console.warn(`Folder path is undefined for folder ID: ${folder._id}`);
+                    deletionResults.errors.push(`Invalid path for folder: ${folder.name}`);
+                    continue;
                 }
-            } else {
-                console.warn(`Folder path is undefined for folder ID: ${folder._id}`);
+
+                // Recursively delete folder and its contents
+                await this.deleteFolderRecursively(folder._id, userId);
+                console.log(`Folder and contents deleted: ${folder.path}`);
+                deletionResults.foldersDeleted++;
+            } catch (error) {
+                console.error(`Error deleting folder: ${folder.path}, Error: ${error.message}`);
+                deletionResults.errors.push(`Failed to delete folder: ${folder.name}`);
             }
         }
 
-        this.recalculateFolderStats(parentId);
+        // Recalculate parent folder stats if needed
+        if (parentId) {
+            try {
+                await this.recalculateFolderStats(parentId);
+            } catch (error) {
+                console.error(`Error recalculating folder stats: ${error.message}`);
+            }
+        }
 
-        return deletionResults.filesDeleted + deletionResults.foldersDeleted;
+        return {
+            success: deletionResults.errors.length === 0,
+            ...deletionResults
+        };
     }
 
     static async deleteFolderRecursively(folderId, userId) {
         try {
             // Find the folder to delete
             const folderToDelete = await Folder.findOne({ _id: folderId, userId });
-
             if (!folderToDelete) {
                 throw new Error(`Folder with ID ${folderId} not found.`);
             }
 
-            // Recursively find all subfolders and files within the specified folder
+            const folderPath = path.join(this.uploadDirectory, folderToDelete.path);
+
+            // Find all subfolders and files
             const subFolders = await Folder.find({
                 path: new RegExp(`^${folderToDelete.path}/`),
-                userId
+                userId,
+                deleted: false
             });
-            const subFolderIds = subFolders.map(folder => folder._id);
-
-            // Find all files within the folder and its subfolders
-            const filesToDelete = await File.find({
+            const subFiles = await File.find({
                 path: new RegExp(`^${folderToDelete.path}/`),
-                userId
+                userId,
+                deleted: false
             });
-            const fileIds = filesToDelete.map(file => file._id);
 
-            // Delete all subfolder and file documents in one go
-            await Folder.updateMany({ _id: { $in: [folderId, ...subFolderIds] } }, { $set: { deleted: true } });
-            await File.updateMany({ _id: { $in: fileIds } }, { $set: { deleted: true } });
+            // Mark all items as deleted in database
+            await Folder.updateMany(
+                { _id: { $in: [folderId, ...subFolders.map(f => f._id)] } },
+                { $set: { deleted: true } }
+            );
+            await File.updateMany(
+                { _id: { $in: subFiles.map(f => f._id) } },
+                { $set: { deleted: true } }
+            );
 
-            console.log(`Deleted folder ${folderToDelete.name} and its contents.`);
-
-            // Delete folders and files from filesystem
-            const folderPath = path.join(this.uploadDirectory, folderToDelete.path);
+            // Delete the physical folder and all its contents
             if (fs.existsSync(folderPath)) {
                 fs.rmSync(folderPath, { recursive: true, force: true });
-                console.log(`Deleted folder and all contents from filesystem at ${folderPath}`);
+                console.log(`Folder physically deleted: ${folderPath}`);
             }
 
-            return { message: 'Folder and all its contents deleted successfully.' };
+            console.log(`Folder ${folderToDelete.name} and its contents deleted completely.`);
+            return { success: true };
         } catch (error) {
-            console.error('Error deleting folder recursively:', error);
-            throw new Error('Failed to delete folder and its contents.');
+            console.error('Error in deleteFolderRecursively:', error);
+            throw error;
         }
     }
 
@@ -395,11 +426,73 @@ class FileService {
     }
 
     static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null) {
-        if (!folder) {
-            folder = '';
+        // Validate items exist and user has access
+        const validatedItems = [];
+        
+        for (const item of items) {
+            try {
+                let itemType = item.type?.toLowerCase();
+                let itemPath;
+                let itemName = item.name;
+                let dbPath;
+                
+                if (!itemType || !['file', 'folder'].includes(itemType)) {
+                    // Try to determine type from database
+                    const file = await File.findById(item.id);
+                    if (file && file.userId.toString() === userId) {
+                        itemType = 'file';
+                        dbPath = file.path;
+                        itemName = file.name;
+                    } else {
+                        const folder = await Folder.findById(item.id);
+                        if (folder && folder.userId.toString() === userId) {
+                            itemType = 'folder';
+                            dbPath = folder.path;
+                            itemName = folder.name;
+                        } else {
+                            throw new Error(`Item not found or access denied: ${item.name}`);
+                        }
+                    }
+                } else {
+                    // Type is specified, validate accordingly
+                    if (itemType === 'folder') {
+                        const folder = await Folder.findById(item.id);
+                        if (!folder || folder.userId.toString() !== userId) {
+                            throw new Error(`Folder not found or access denied: ${itemName}`);
+                        }
+                        dbPath = folder.path;
+                    } else {
+                        const file = await File.findById(item.id);
+                        if (!file || file.userId.toString() !== userId) {
+                            throw new Error(`File not found or access denied: ${itemName}`);
+                        }
+                        dbPath = file.path;
+                    }
+                }
+
+                // Construct full path
+                itemPath = path.join(this.uploadDirectory, dbPath);
+                
+                // Verify path exists
+                if (!fs.existsSync(itemPath)) {
+                    throw new Error(`Path not found for ${itemName}: ${itemPath}`);
+                }
+
+                validatedItems.push({
+                    id: item.id,
+                    type: itemType,
+                    name: itemName,
+                    path: dbPath,
+                    fullPath: itemPath
+                });
+            } catch (error) {
+                console.error(`Error validating item ${item.name}:`, error);
+                throw error;
+            }
         }
 
-        if (!parentId) {
+        if (!folder) {
+            folder = '';
             parentId = null;
         }
 
@@ -412,141 +505,115 @@ class FileService {
 
         signal.addEventListener('abort', () => {
             console.log(`Aborting compression for ${zipFileName}.`);
-            archive.abort();
+            if (archive) archive.abort();
             if (output) {
                 output.destroy();
-                fs.unlink(zipFilePath, (err) => {
-                    if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
-                });
+                if (fs.existsSync(zipFilePath)) {
+                    fs.unlink(zipFilePath, (err) => {
+                        if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
+                    });
+                }
             }
         });
 
         const timestamp = Date.now();
-        const name = zipFileName || `compressed_${timestamp}.zip`; // Use provided name or default
+        const name = zipFileName || `compressed_${timestamp}.zip`;
         const targetFolder = path.join(this.uploadDirectory, userId, folder);
         const zipFilePath = path.join(targetFolder, name);
 
         if (!fs.existsSync(targetFolder)) {
-            throw new Error("The specified folder doesn't exist.");
+            fs.mkdirpSync(targetFolder);
         }
 
         return new Promise(async (resolve, reject) => {
-            output = fs.createWriteStream(zipFilePath);
-            archive = archiver('zip', { zlib: { level: 9 } });
-            this.ongoingCompressions.get(key).activeArchive = archive;
-            this.ongoingCompressions.get(key).output = output;
-            // let processedFiles = 0;
-            // let totalBytes = 0;
-            let processedBytes = 0;
+            try {
+                output = fs.createWriteStream(zipFilePath);
+                archive = archiver('zip', { zlib: { level: 9 } });
+                this.ongoingCompressions.get(key).activeArchive = archive;
+                this.ongoingCompressions.get(key).output = output;
+                let processedBytes = 0;
 
-            signal.addEventListener('abort', () => {
-                console.log(`Compression for ${zipFileName} aborted.`);
-                archive.abort(); // Abort archiving
-                output.destroy(); // Forcefully close the output stream
-                fs.unlink(zipFilePath, (err) => {
-                    if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
-                });
-            });
+                output.on('close', async () => {
+                    try {
+                        const stats = fs.statSync(zipFilePath);
+                        const compressedFile = new File({
+                            name,
+                            path: path.join(userId, folder, name), // Include userId in the path
+                            size: stats.size,
+                            mimetype: 'application/zip',
+                            createdAt: new Date(),
+                            deleted: false,
+                            userId: userId,
+                            parent_id: parentId
+                        });
 
-            output.on('close', async () => {
-                try {
-                    const stats = fs.statSync(zipFilePath);
-
-                    // Attempt to create a new File record for the compressed file
-                    const compressedFile = new File({
-                        name,
-                        path: path.join(userId, folder, name),
-                        size: stats.size,
-                        mimetype: 'application/zip',
-                        createdAt: new Date(),
-                        deleted: false,
-                        userId: userId,
-                        parent_id: parentId
-                    });
-
-                    await compressedFile.save();
-
-                    resolve(compressedFile);
-                } catch (error) {
-                    if (signal.aborted) {
-                        console.log(`Compression for ${zipFileName} was aborted successfully.`);
-                    } else {
+                        await compressedFile.save();
+                        resolve({ success: true, file: compressedFile });
+                    } catch (error) {
                         console.error('Error saving metadata:', error);
+                        reject(new Error('Failed to save compressed file metadata: ' + error.message));
                     }
-                    reject(new Error('Failed to save compressed file metadata: ' + error.message));
+                });
+
+                output.on('error', (err) => {
+                    console.error('Error during compression:', err);
+                    reject(new Error('Failed to compress files: ' + err.message));
+                });
+
+                archive.on('error', (err) => {
+                    console.error('Archive error:', err);
+                    reject(new Error('Archive error: ' + err.message));
+                });
+
+                let totalSize = 0;
+                for (const item of validatedItems) {
+                    if (!fs.existsSync(item.fullPath)) {
+                        throw new Error(`Path not found: ${item.name}`);
+                    }
+                    const stats = fs.statSync(item.fullPath);
+                    if (item.type === 'folder') {
+                        totalSize += this.calculateFolderSize(item.fullPath);
+                    } else {
+                        totalSize += stats.size;
+                    }
                 }
-            });
 
-            output.on('error', (err) => {
-                console.error('Error during compression:', err); // Log compression error
-                reject(new Error('Failed to compress files: ' + err.message));
-            });
+                archive.on('data', (chunk) => {
+                    processedBytes += chunk.length;
+                    if (progressCallback && typeof progressCallback === 'function') {
+                        const progress = Math.round((processedBytes / totalSize) * 100);
+                        progressCallback(progress);
+                    }
+                });
 
-            archive.on('error', (err) => {
-                console.error('Archive error:', err);
-                reject(new Error('Archive error: ' + err.message));
-            });
+                archive.pipe(output);
 
-            // archive.on('progress', (progressData) => {
-                // if (progressCallback && typeof progressCallback === 'function') {
-                //     if (!totalBytes) {
-                //         // Calculate total bytes once, using the total size of all items
-                //         totalBytes = items.reduce((sum, item) => {
-                //             const itemPath = path.join(this.uploadDirectory, userId, item);
-                //             return sum + fs.statSync(itemPath).size;
-                //         }, 0);
-                //     }
-                //
-                //     // Calculate progress based on compressed bytes
-                //     const compressedBytes = progressData.fs.processedBytes;
-                //     const progress = Math.round((compressedBytes / totalBytes) * 100);
-                //     // const progress = Math.round((progressData.entries.processed / items.length) * 100);
-                //     progressCallback(progress);
-                // }
-            // });
+                for (const item of validatedItems) {
+                    if (signal.aborted) {
+                        console.log('Aborting compression process...');
+                        throw new Error('Compression process aborted');
+                    }
 
-            // Calculate total bytes for all items
-            let totalSize = this.calculateTotalSize(items, userId);
-
-            // Listen for 'data' event to track compressed bytes
-            archive.on('data', (chunk) => {
-                processedBytes += chunk.length;
-                if (progressCallback && typeof progressCallback === 'function') {
-                    const progress = Math.round((processedBytes / totalSize) * 100);
-                    progressCallback(progress);
+                    if (item.type === 'folder') {
+                        archive.directory(item.fullPath, item.name);
+                    } else {
+                        archive.file(item.fullPath, { name: item.name });
+                    }
                 }
-            });
 
-            archive.pipe(output);
+                await archive.finalize();
+                this.ongoingCompressions.delete(key);
+                await this.recalculateFolderStats(parentId);
 
-            // items.forEach(item => {
-            //     const itemPath = path.join(this.uploadDirectory, userId, item);
-            //     if (fs.statSync(itemPath).isDirectory()) {
-            //         archive.directory(itemPath, item);
-            //     } else {
-            //         archive.file(itemPath, { name: item });
-            //     }
-            //     processedFiles++;
-            // });
-
-            items.forEach((item) => {
-                if (signal.aborted) {
-                    console.log('Aborting compression process...');
-                    throw new Error('Compression process aborted');
+            } catch (error) {
+                console.error('Error in compression process:', error);
+                if (output) output.destroy();
+                if (fs.existsSync(zipFilePath)) {
+                    fs.unlink(zipFilePath, () => {});
                 }
-                const itemPath = path.join(this.uploadDirectory, userId, item);
-                if (fs.statSync(itemPath).isDirectory()) {
-                    archive.directory(itemPath, item);
-                } else {
-                    archive.file(itemPath, { name: item });
-                }
-            });
-
-            await archive.finalize();
-
-            this.ongoingCompressions.delete(key);
-
-            this.recalculateFolderStats(parentId);
+                this.ongoingCompressions.delete(key);
+                reject(error);
+            }
         });
     }
 
@@ -570,17 +637,11 @@ class FileService {
         }
 
         const extractedItems = [];
+
         await extract(zipFilePath, {
             dir: targetDir,
             onEntry: async (entry) => {
-                const fullPath = path.join(targetDir, entry.fileName);
-                const relativePath = path.relative(rootDir, fullPath);
-
-                const parts = relativePath.split('/');
-                const segments = parts.map((_, index) => parts.slice(0, index + 1).join('/'));
-                for (const part of segments) {
-                    extractedItems.push(part);
-                }
+                extractedItems.push(entry.fileName);
             },
         });
 
@@ -639,12 +700,6 @@ class FileService {
 
             // Update parentFolderId for nested items
             parentFolderId = folderDoc._id;
-        }
-
-        if (!isRoot) {
-            // If not root, remove the first item (folder) as it is already created
-            currentPath = currentPath.split('/');
-            currentPath = currentPath.slice(0, currentPath.length - 1).join('/');
         }
 
         for (const item of items) {
@@ -808,69 +863,75 @@ class FileService {
         return `${isFolder ? 'Folder' : 'File'} renamed successfully`;
     }
 
-    static async moveItems(itemIds, targetFolderId) {
-        try {
-            // Validate the target folder
-            const targetFolder = await Folder.findById(targetFolderId);
-            if (!targetFolder) {
-                throw new Error('Invalid target folder');
-            }
+    static async moveItems(userId, itemIds, targetFolderId, progressCallback) {
+        let targetFolder;
 
-            for (const itemId of itemIds) {
-                // Find the item to move (file or folder)
-                let item = await File.findById(itemId) || await Folder.findById(itemId);
-                if (!item) {
-                    console.warn(`Item with ID ${itemId} not found. Skipping.`);
-                    continue;
-                }
-
-                // Define old and new paths
-                const oldPath = item.path;
-                const newPath = path.join(targetFolder.path, item.name);
-
-                // Move the item on the filesystem
-                await fs.move(
-                    path.join(this.uploadDirectory, oldPath),
-                    path.join(this.uploadDirectory, newPath),
-                    { overwrite: false }
-                );
-
-                // Update item's `parent_id` and `path` in the database
-                item.parent_id = targetFolderId;
-                item.path = newPath;
-                await item.save();
-
-                // If the item is a folder, update the paths of all child items
-                if (item instanceof Folder) {
-                    const oldPathSegment = oldPath;
-                    const newPathSegment = newPath;
-
-                    // Update paths of child folders
-                    const childFolders = await Folder.find({ path: new RegExp(`^${oldPathSegment}/`) });
-                    for (const childFolder of childFolders) {
-                        childFolder.path = childFolder.path.replace(oldPathSegment, newPathSegment);
-                        await childFolder.save();
-                    }
-
-                    // Update paths of child files
-                    const childFiles = await File.find({ path: new RegExp(`^${oldPathSegment}/`) });
-                    for (const childFile of childFiles) {
-                        childFile.path = childFile.path.replace(oldPathSegment, newPathSegment);
-                        await childFile.save();
-                    }
-                }
-
-                console.log(`Moved item: ${item.name}`);
-            }
-
-            // Recalculate stats for the target folder
-            await this.recalculateFolderStats(targetFolderId);
-
-            return { message: 'Items moved successfully' };
-        } catch (error) {
-            console.error('Error moving items:', error.message);
-            throw new Error('Failed to move items');
+        // Validate the target folder
+        if (!targetFolderId || targetFolderId === 'root') {
+            targetFolder = {path: userId};
+        } else {
+            targetFolder = await Folder.findById(targetFolderId);
         }
+
+        const totalItems = itemIds.length;
+        let processedItems = 0;
+
+        for (const itemId of itemIds) {
+            // Find the item to move (file or folder)
+            let item = await File.findById(itemId) || await Folder.findById(itemId);
+            if (!item) {
+                console.warn(`Item with ID ${itemId} not found. Skipping.`);
+                continue;
+            }
+
+            // Define old and new paths
+            const oldPath = item.path;
+            const newPath = path.join(targetFolder.path, item.name);
+
+            // Move the item on the filesystem
+            await fs.move(
+                path.join(this.uploadDirectory, oldPath),
+                path.join(this.uploadDirectory, newPath),
+                {overwrite: false}
+            );
+
+            // Update item's `parent_id` and `path` in the database
+            item.parent_id = targetFolderId === 'root' ? null : targetFolderId;
+            item.path = newPath;
+            await item.save();
+
+            // If the item is a folder, update the paths of all child items
+            if (item instanceof Folder) {
+                const oldPathSegment = oldPath;
+                const newPathSegment = newPath;
+
+                // Update paths of child folders
+                const childFolders = await Folder.find({path: new RegExp(`^${oldPathSegment}/`)});
+                for (const childFolder of childFolders) {
+                    childFolder.path = childFolder.path.replace(oldPathSegment, newPathSegment);
+                    await childFolder.save();
+                }
+
+                // Update paths of child files
+                const childFiles = await File.find({path: new RegExp(`^${oldPathSegment}/`)});
+                for (const childFile of childFiles) {
+                    childFile.path = childFile.path.replace(oldPathSegment, newPathSegment);
+                    await childFile.save();
+                }
+            }
+
+            if (progressCallback && typeof progressCallback === 'function') {
+                const progress = Math.round((processedItems / totalItems) * 100);
+                progressCallback(item.name, progress);
+            }
+
+            console.log(`Moved item: ${item.name}`);
+        }
+
+        // Recalculate stats for the target folder
+        await this.recalculateFolderStats(targetFolderId);
+
+        return {message: 'Items moved successfully'};
     }
 
     static async moveItemsIntoZip(userId, itemIds, zipFileId) {
@@ -1043,6 +1104,10 @@ class FileService {
 
     static async recalculateFolderStats(folderId)
     {
+        if (!folderId || folderId === 'root') {
+            return;
+        }
+
         try {
             let folder = null;
             // Find the folder by its ID
@@ -1143,6 +1208,120 @@ class FileService {
         } catch (error) {
             console.error('Error retrieving uploaded chunks:', error.message);
             throw new Error('Failed to retrieve upload progress.');
+        }
+    }
+
+    static async getFolderTree(userId, parentId = null, isRoot = true) {
+        try {
+            if (parentId === 'root') {
+                parentId = null;
+                isRoot = true;
+            }
+
+            // Fetch folders for the current parent
+            const folders = await Folder.find({ userId, parent_id: parentId, deleted: false }).lean();
+
+            // Construct the tree for each folder
+            const tree = await Promise.all(folders.map(async (folder) => {
+                // Only check for subfolders in tree mode
+                const subfolderCount = await Folder.countDocuments({ 
+                    userId, 
+                    parent_id: folder._id.toString(), 
+                    deleted: false 
+                });
+
+                const children = await this.getFolderTree(userId, folder._id, false); // Recursive call to get child folders
+                return {
+                    id: folder._id,
+                    text: folder.name,
+                    expanded: false,
+                    children: children.length > 0 ? children : [],
+                    parentId: folder.parent_id,
+                    leaf: subfolderCount === 0 // Leaf if no subfolders
+                };
+            }));
+
+            return tree;
+        } catch (error) {
+            console.error('Error in getFolderTree:', error.message);
+            throw new Error('Failed to construct folder tree');
+        }
+    }
+
+    static async setPassword(userId, itemId, password, isFolder) {
+        try {
+            const Model = isFolder ? Folder : File;
+            const item = await Model.findOne({ _id: itemId, userId, deleted: false });
+
+            if (!item) {
+                throw new Error('Item not found');
+            }
+
+            // Hash the password before storing
+            const hashedPassword = await bcrypt.hash(password, 10);
+
+            item.isPasswordProtected = true;
+            item.password = hashedPassword;
+            await item.save();
+
+            return { success: true };
+        } catch (error) {
+            console.error('Error setting password:', error.message);
+            throw error;
+        }
+    }
+
+    static async removePassword(userId, itemId, currentPassword, isFolder) {
+        try {
+            const Model = isFolder ? Folder : File;
+            const item = await Model.findOne({ _id: itemId, userId, deleted: false }).select('+password');
+
+            if (!item) {
+                throw new Error('Item not found');
+            }
+
+            // Verify current password
+            const isValid = await bcrypt.compare(currentPassword, item.password);
+            if (!isValid) {
+                throw new Error('Invalid password');
+            }
+
+            item.isPasswordProtected = false;
+            item.password = undefined;
+            await item.save();
+
+            return { success: true };
+        } catch (error) {
+            console.error('Error removing password:', error.message);
+            throw error;
+        }
+    }
+
+    static async verifyPassword(userId, itemId, password, isFolder) {
+        try {
+            const Model = isFolder ? Folder : File;
+            const item = await Model.findOne({ 
+                _id: itemId, 
+                userId, 
+                deleted: false,
+                isPasswordProtected: true 
+            }).select('+password');
+
+            if (!item) {
+                throw new Error('Item not found or not password protected');
+            }
+
+            const isValid = await bcrypt.compare(password, item.password);
+            
+            if (isValid) {
+                item.lastAccessed = new Date();
+                await item.save();
+            }
+
+            return { success: isValid };
+        } catch (error) {
+            console.error('Error verifying password:', error.message);
+            throw error;
         }
     }
 }

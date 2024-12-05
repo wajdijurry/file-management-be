@@ -28,7 +28,6 @@ exports.uploadFiles = async (req, res) => {
 // Get all files
 exports.getFiles = async (req, res) => {
     try {
-        const folderName = req.query.folder || '';
         const parentFolderId = req.query.parent_id || null;
 
         const files = await FileService.getFiles(req.userId, parentFolderId);
@@ -106,11 +105,12 @@ exports.deleteMultipleFiles = async (req, res) => {
     try {
         const deletedCount = await FileService.deleteMultipleFiles(req.userId, ids, parentId);
 
-        if (deletedCount > 0) {
-            return res.json({ success: true, message: 'Files deleted successfully.', deletedCount });
-        } else {
-            return res.status(404).json({ success: false, message: 'No files found for the provided IDs.' });
-        }
+        return res.json({ success: true, message: 'Files deleted successfully.', deletedCount });
+        // if (deletedCount > 0) {
+        //     return res.json({ success: true, message: 'Files deleted successfully.', deletedCount });
+        // } else {
+        //     return res.status(404).json({ success: false, message: 'No files found for the provided IDs.' });
+        // }
     } catch (error) {
         console.log(error);
         res.status(500).json({ success: false, message: 'An error occurred while deleting files.' });
@@ -142,11 +142,18 @@ exports.compressFiles = async (req, res) => {
             io.emit('compressionProgress', { progress });
         };
 
-        const compressedFile = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId, progressCallback);
-        res.status(200).json({ message: 'Files compressed successfully', file: compressedFile });
+        const result = await FileService.compressFiles(req.userId, items, folder, zipFileName, parentId, progressCallback);
+        res.status(200).json({
+            success: true,
+            message: 'Files compressed successfully',
+            file: result.file
+        });
     } catch (error) {
         console.error('Error compressing files:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 };
 
@@ -199,14 +206,19 @@ exports.renameItem = async (req, res) => {
 };
 
 exports.moveItem = async (req, res) => {
-    const { itemIds, targetId, isTargetZip } = req.body;
+    const { itemIds, targetId, isTargetZip, progressId } = req.body;
 
     try {
+        const progressCallback = (itemName, progress) => {
+            const io = getIO();
+            io.emit('movingProgress', { itemName, progress, progressId });
+        };
+
         if (isTargetZip) {
             const result = await FileService.moveItemsIntoZip(req.userId, itemIds, targetId);
             res.status(200).json({ success: true, message: 'Items moved into ZIP file successfully', result });
         } else {
-            const result = await FileService.moveItems(itemIds, targetId);
+            const result = await FileService.moveItems(req.userId, itemIds, targetId, progressCallback);
             res.status(200).json({ success: true, message: 'Items moved successfully', result });
         }
     } catch (error) {
@@ -218,50 +230,59 @@ exports.moveItem = async (req, res) => {
 
 exports.download = async (req, res) => {
     const filePath = req.body.filePath;
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const chunkSize = parseInt(req.query.chunkSize, 10) || 1024 * 1024; // Default 1MB
     const absolutePath = path.join(FileService.uploadDirectory, filePath);
+
+    console.log('Download request:', {
+        filePath,
+        offset,
+        chunkSize,
+        absolutePath
+    });
 
     try {
         if (!fs.existsSync(absolutePath)) {
+            console.error('File not found:', absolutePath);
             return res.status(404).send('File not found.');
         }
 
         const stats = fs.statSync(absolutePath);
         const fileSize = stats.size;
-        const range = req.headers.range;
 
-        if (range) {
-            // Parse the Range header
-            const parts = range.replace(/bytes=/, '').split('-');
-            const start = parseInt(parts[0], 10);
-            const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-            if (start >= fileSize) {
-                res.status(416).send('Requested range not satisfiable');
-                return;
-            }
-
-            const chunkSize = end - start + 1;
-            const fileStream = fs.createReadStream(absolutePath, { start, end });
-
-            res.writeHead(206, {
-                'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-                'Accept-Ranges': 'bytes',
-                'Content-Length': chunkSize,
-                'Content-Type': 'application/octet-stream',
+        // If offset equals file size, return a completed response
+        if (offset >= fileSize) {
+            console.log('Download complete - offset matches or exceeds file size:', {
+                offset,
+                fileSize
             });
-
-            fileStream.pipe(res);
-        } else {
-            // Full file download
-            res.writeHead(200, {
-                'Content-Length': fileSize,
-                'Content-Type': 'application/octet-stream',
-            });
-
-            fs.createReadStream(absolutePath).pipe(res);
+            return res.status(204).end(); // No Content - indicates successful completion
         }
+
+        // Calculate end position for the chunk
+        const end = Math.min(offset + chunkSize - 1, fileSize - 1);
+        const contentLength = end - offset + 1;
+        
+        console.log('Chunk details:', {
+            fileSize,
+            start: offset,
+            end,
+            contentLength,
+            isLastChunk: end === fileSize - 1
+        });
+
+        const chunkStream = fs.createReadStream(absolutePath, { start: offset, end });
+
+        res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': contentLength,
+            'Accept-Ranges': 'bytes',
+            'Content-Range': `bytes ${offset}-${end}/${fileSize}`
+        });
+
+        chunkStream.pipe(res);
     } catch (error) {
-        console.error('Error during download:', error.message);
+        console.error('Error during download:', error);
         res.status(500).send('Failed to download file.');
     }
 };
@@ -305,3 +326,45 @@ exports.getUploadStatus = async (req, res) => {
     }
 };
 
+exports.getFolderTree = async (req, res) => {
+    try {
+        const tree = await FileService.getFolderTree(req.userId, req.query.parentId); // Start from root
+        res.status(200).json({ success: true, folders: tree });
+    } catch (error) {
+        console.error('Error fetching folder tree:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch folder tree' });
+    }
+};
+
+// Set password protection
+exports.setPassword = async (req, res) => {
+    try {
+        const { itemId, password, isFolder } = req.body;
+        const result = await FileService.setPassword(req.userId, itemId, password, isFolder);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ message: error.message });
+    }
+};
+
+// Remove password protection
+exports.removePassword = async (req, res) => {
+    try {
+        const { itemId, currentPassword, isFolder } = req.body;
+        const result = await FileService.removePassword(req.userId, itemId, currentPassword, isFolder);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ message: error.message });
+    }
+};
+
+// Verify password for protected item
+exports.verifyPassword = async (req, res) => {
+    try {
+        const { itemId, password, isFolder } = req.body;
+        const result = await FileService.verifyPassword(req.userId, itemId, password, isFolder);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ message: error.message });
+    }
+};
