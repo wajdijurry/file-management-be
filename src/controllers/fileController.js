@@ -135,35 +135,36 @@ exports.createFolder = async (req, res) => {
 
 exports.compressFiles = async (req, res) => {
     try {
-        const { items, folder, zipFileName, parentId, archiveType = 'zip', compressionLevel = 6 } = req.body;
+        const userId = req.userId; 
+        const { items, folder, parentId, zipFileName, archiveType, compressionLevel, progressId } = req.body;
 
-        const progressCallback = (progress) => {
-            const io = getIO();
-            io.emit('compressionProgress', { progress });
-        };
+        // Validate request
+        if (!items || !Array.isArray(items)) {
+            return res.status(400).json({ error: 'Invalid items array' });
+        }
 
-        const result = await FileService.compressFiles(
-            req.userId,
+        // Add job to compression queue
+        const compressionQueue = require('../queues/compressionQueue');
+        const job = await compressionQueue.add({
+            userId,
             items,
             folder,
             zipFileName,
             parentId,
-            progressCallback,
             archiveType,
-            compressionLevel
-        );
+            compressionLevel,
+            progressId
+        });
 
-        res.status(200).json({
-            success: true,
-            message: 'Files compressed successfully',
-            file: result.file
+        // Return job ID immediately
+        res.json({ 
+            success: true, 
+            message: 'Compression started',
+            jobId: job.id
         });
     } catch (error) {
-        console.error('Error compressing files:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('Error in compression:', error);
+        res.status(500).json({ error: error.message });
     }
 };
 

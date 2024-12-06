@@ -9,6 +9,9 @@ const extract = require('extract-zip');
 const { AbortController } = require('abort-controller');
 const AdmZip = require('adm-zip');
 const bcrypt = require('bcrypt');
+const Seven = require('node-7z');
+const { spawn } = require('child_process');
+const CompressionService = require('./compressionService');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -188,6 +191,7 @@ class FileService {
                     path: folder.path,
                     hasChildren: folder.hasChildren,
                     isLocked: folder.isPasswordProtected && !folder.lastAccessed,
+                    isPasswordProtected: folder.isPasswordProtected,
                     password: undefined
                 };
             }),
@@ -207,6 +211,7 @@ class FileService {
                     type: fileRecord.mimetype ? fileRecord.mimetype.split('/')[0] : 'unknown',
                     path: fileRecord.path,
                     isLocked: fileRecord.isPasswordProtected && !fileRecord.lastAccessed,
+                    isPasswordProtected: fileRecord.isPasswordProtected,
                     password: undefined
                 };
             })
@@ -426,111 +431,135 @@ class FileService {
     }
 
     static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null, archiveType = 'zip', compressionLevel = 6) {
+        // Validate items exist and user has access
         const validatedItems = [];
-    
-        // Retrieve paths and validate items from database
+
         for (const itemId of items) {
             try {
                 let item;
                 let itemPath;
                 let itemType;
-    
+                let itemName;
+
                 // Try to find the item as a file first
-                item = await File.findById(itemId);
-                if (item && item.userId.toString() === userId) {
+                const file = await File.findById(itemId);
+                if (file && file.userId.toString() === userId) {
                     itemType = 'file';
-                    itemPath = path.join(this.uploadDirectory, item.path);
+                    itemPath = path.join(this.uploadDirectory, file.path);
+                    itemName = file.name;
                 } else {
                     // If not found as file, try as a folder
-                    item = await Folder.findById(itemId);
-                    if (item && item.userId.toString() === userId) {
+                    const folder = await Folder.findById(itemId);
+                    if (folder && folder.userId.toString() === userId) {
                         itemType = 'folder';
-                        itemPath = path.join(this.uploadDirectory, item.path);
+                        itemPath = path.join(this.uploadDirectory, folder.path);
+                        itemName = folder.name;
                     } else {
                         throw new Error(`Item not found or access denied: ${itemId}`);
                     }
                 }
-    
-                if (!fs.existsSync(itemPath)) throw new Error(`Path not found: ${itemPath}`);
-    
+
+                // Verify path exists
+                if (!fs.existsSync(itemPath)) {
+                    throw new Error(`Path not found for ${itemName}: ${itemPath}`);
+                }
+
                 validatedItems.push({
-                    id: item._id,
+                    id: itemId,
                     type: itemType,
-                    name: item.name,
-                    fullPath: itemPath,
+                    name: itemName,
+                    fullPath: itemPath
                 });
             } catch (error) {
                 console.error(`Error validating item ${itemId}:`, error);
                 throw error;
             }
         }
-    
-        const name = zipFileName || `compressed_${Date.now()}.${archiveType}`;
-        const targetFolder = path.join(this.uploadDirectory, userId, folder);
-        const archiveFilePath = path.join(targetFolder, name);
-    
-        if (!fs.existsSync(targetFolder)) fs.mkdirSync(targetFolder, { recursive: true });
-    
-        const archiveOptions = archiveType === 'zip' ? { zlib: { level: compressionLevel } } : {};
-        const archiverType = archiveType === '7z' ? '7z' : 'zip';
-    
-        return new Promise((resolve, reject) => {
-            const output = fs.createWriteStream(archiveFilePath);
-            const archive = archiver(archiverType, archiveOptions);
-            let processedBytes = 0;
-            let totalBytes = 0;
-    
-            // Calculate total size for progress
-            for (const item of validatedItems) {
-                const stats = fs.statSync(item.fullPath);
-                totalBytes += item.type === 'folder' ? this.calculateFolderSize(item.fullPath) : stats.size;
-            }
-    
-            archive.pipe(output);
-    
-            // Handle progress callback
-            archive.on('data', (chunk) => {
-                processedBytes += chunk.length;
-                if (progressCallback && typeof progressCallback === 'function') {
-                    const progress = Math.round((processedBytes / totalBytes) * 100);
-                    progressCallback(progress);
-                }
-            });
-    
-            output.on('close', async () => {
-                try {
-                    const stats = fs.statSync(archiveFilePath);
-                    const compressedFile = new File({
-                        name,
-                        path: path.join(userId, folder, name),
-                        size: stats.size,
-                        mimetype: `application/${archiveType}`,
-                        createdAt: new Date(),
-                        deleted: false,
-                        userId,
-                        parent_id: parentId,
+
+        if (!folder) {
+            folder = '';
+            parentId = null;
+        }
+
+        const key = `${userId}-${zipFileName}`;
+        const abortController = new AbortController();
+        this.ongoingCompressions.set(key, { abortController, activeArchive: null, output: null });
+
+        const signal = abortController.signal;
+        let output, archive;
+
+        signal.addEventListener('abort', () => {
+            console.log(`Aborting compression for ${zipFileName}.`);
+            if (archive) archive.abort();
+            if (output) {
+                output.destroy();
+                if (fs.existsSync(zipFilePath)) {
+                    fs.unlink(zipFilePath, (err) => {
+                        if (err) console.error(`Error deleting partial ZIP file: ${err.message}`);
                     });
-                    await compressedFile.save();
-                    resolve({ success: true, file: compressedFile });
-                } catch (error) {
-                    reject(new Error(`Failed to save compressed file metadata: ${error.message}`));
-                }
-            });
-    
-            output.on('error', reject);
-            archive.on('error', reject);
-    
-            for (const item of validatedItems) {
-                if (item.type === 'folder') {
-                    archive.directory(item.fullPath, item.name);
-                } else {
-                    archive.file(item.fullPath, { name: item.name });
                 }
             }
-    
-            archive.finalize();
         });
-    }    
+
+        // Determine file extension and mime type based on archive type
+        let fileExtension, mimeType, sevenZFormat;
+        switch (archiveType.toLowerCase()) {
+            case '7z':
+                fileExtension = '.7z';
+                mimeType = 'application/x-7z-compressed';
+                sevenZFormat = '7z';
+                break;
+            case 'tgz':
+                fileExtension = '.tar.gz';
+                mimeType = 'application/gzip';
+                sevenZFormat = 'tgz';
+                break;
+            case 'zip':
+            default:
+                fileExtension = '.zip';
+                mimeType = 'application/zip';
+                sevenZFormat = 'zip';
+        }
+
+        const timestamp = Date.now();
+        const name = zipFileName || `compressed_${timestamp}${fileExtension}`;
+        const targetFolder = path.join(this.uploadDirectory, userId, folder);
+        const zipFilePath = path.join(targetFolder, name);
+
+        if (!fs.existsSync(targetFolder)) {
+            fs.mkdirpSync(targetFolder);
+        }
+
+        const filePaths = validatedItems.map(item => item.fullPath);
+
+        return CompressionService.compressFiles(filePaths, zipFilePath, archiveType, compressionLevel, progressCallback)
+            .then(result => {
+                const compressedFile = new File({
+                    name,
+                    path: path.join(userId, folder, name),
+                    size: result.archiveSize,
+                    mimetype: mimeType,
+                    createdAt: new Date(),
+                    deleted: false,
+                    userId: userId,
+                    parent_id: parentId
+                });
+
+                return compressedFile.save()
+                    .then(() => {
+                        return { success: true, file: compressedFile };
+                    });
+            })
+            .catch(error => {
+                console.error('Error in compression process:', error);
+                if (output) output.destroy();
+                if (fs.existsSync(zipFilePath)) {
+                    fs.unlink(zipFilePath, () => {});
+                }
+                this.ongoingCompressions.delete(key);
+                throw error;
+            });
+    }
 
     static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
         const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
@@ -735,19 +764,19 @@ class FileService {
 
             // Update all child folders and files with paths that start with the old path
             const oldPathSegment = oldPath;
-            const updatedPathSegment = newPath;
+            const newPathSegment = newPath;
 
             // Find and update child folders
-            const childFolders = await Folder.find({ userId: userId, path: new RegExp(`^${oldPathSegment}/`) });
+            const childFolders = await Folder.find({ userId, path: new RegExp(`^${oldPathSegment}/`) });
             const updateFolderPromises = childFolders.map(folder => {
-                folder.path = folder.path.replace(oldPathSegment, updatedPathSegment);
+                folder.path = folder.path.replace(oldPathSegment, newPathSegment);
                 return folder.save();
             });
 
             // Find and update child files
-            const childFiles = await File.find({ path: new RegExp(`^${oldPathSegment}/`) });
+            const childFiles = await File.find({ userId, path: new RegExp(`^${oldPathSegment}/`)});
             const updateFilePromises = childFiles.map(file => {
-                file.path = file.path.replace(oldPathSegment, updatedPathSegment);
+                file.path = file.path.replace(oldPathSegment, newPathSegment);
                 return file.save();
             });
 
@@ -924,7 +953,6 @@ class FileService {
     }
 
     // Helper Method: Add Folder and Its Contents to Archive
-// Helper Method: Add Folder and Its Contents to Archive
     static async addFolderToArchive(archive, folderPath, folderName) {
         const items = fs.readdirSync(folderPath);
 
@@ -1195,14 +1223,14 @@ class FileService {
                 throw new Error('Item not found');
             }
 
-            // Verify current password
-            const isValid = await bcrypt.compare(currentPassword, item.password);
-            if (!isValid) {
+            const isMatch = await bcrypt.compare(currentPassword, item.password);
+            if (!isMatch) {
                 throw new Error('Invalid password');
             }
 
             item.isPasswordProtected = false;
             item.password = undefined;
+            item.isPasswordProtected = false; // Reset canRemovePassword after removing password
             await item.save();
 
             return { success: true };
@@ -1230,6 +1258,7 @@ class FileService {
             
             if (isValid) {
                 item.lastAccessed = new Date();
+                item.isPasswordProtected = true; // Allow password removal after successful verification
                 await item.save();
             }
 
