@@ -146,6 +146,12 @@ exports.compressFiles = async (req, res) => {
             return res.status(400).json({ error: 'Invalid items array' });
         }
 
+        console.log('Creating compression job:', {
+            progressId,
+            zipFileName,
+            items: items.length
+        });
+
         // Add job to compression queue
         const compressionQueue = require('../queues/compressionQueue');
         const job = await compressionQueue.add({
@@ -159,11 +165,18 @@ exports.compressFiles = async (req, res) => {
             progressId
         });
 
+        console.log('Created compression job:', {
+            jobId: job.id,
+            progressId,
+            zipFileName
+        });
+
         // Return job ID immediately
         res.json({ 
             success: true, 
             message: 'Compression started',
-            jobId: job.id
+            jobId: job.id,
+            progressId
         });
     } catch (error) {
         console.error('Error in compression:', error);
@@ -190,26 +203,37 @@ exports.decompressFile = async (req, res) => {
 
 exports.stopCompression = async (req, res) => {
     try {
-        const { zipFileName, folder, parentId } = req.body;
+        const { jobId } = req.body;
 
-        if (!zipFileName || !folder) {
-            return res.status(400).json({ error: 'zipFileName and folder are required.' });
+        if (!jobId) {
+            return res.status(400).json({ error: 'jobId is required.' });
         }
 
-        const stopped = await FileService.stopCompression(req.userId, zipFileName, folder, parentId);
+        const compressionQueue = require('../queues/compressionQueue');
+        console.log('Attempting to cancel job:', jobId);
 
-        if (stopped) {
-            res.status(200).json({ success: true,message: 'Compression process stopped successfully.' });
+        // Use the new cancelJob function that handles both active and queued jobs
+        const cancelled = await compressionQueue.cancelJob(jobId, jobId);
+
+        if (cancelled) {
+            res.status(200).json({ 
+                success: true,
+                message: 'Compression job cancelled successfully.',
+                jobId
+            });
         } else {
-            res.status(404).json({ success: false, error: 'No ongoing compression found for the specified file.' });
+            console.log('No job found with ID:', jobId);
+            res.status(404).json({ 
+                success: false, 
+                error: 'No compression job found with the specified ID.' 
+            });
         }
     } catch (error) {
-        console.error('Error stopping compression:', error);
-        res.status(500).json({ error: 'Failed to stop compression.' });
+        console.error('Error cancelling compression:', error);
+        res.status(500).json({ error: 'Failed to cancel compression job.' });
     }
 };
 
-// Function to delete a single file
 exports.renameItem = async (req, res) => {
     try {
         await FileService.renameItem(req.userId, req.body.itemId, req.body.newName, req.body.isFolder);

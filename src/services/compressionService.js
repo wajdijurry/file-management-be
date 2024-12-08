@@ -89,7 +89,7 @@ class CompressionService {
         return stats.size;
     }
 
-    static async compressFiles(filePaths, archivePath, archiveType = '7z', compressionLevel = 5, progressCallback = null) {
+    static async compressFiles(filePaths, archivePath, archiveType = '7z', compressionLevel = 5, progressCallback = null, cancelCallback = null) {
         let totalSize = 0;
         let progressInterval;
 
@@ -136,7 +136,7 @@ class CompressionService {
             });
 
             // Execute compression
-            await this.spawnCompressionProcess(command, args);
+            await this.spawnCompressionProcessWithCancellation(command, args, cancelCallback);
 
             // Validate compressed file
             const archiveSize = await this.validateCompressedFile(archivePath, totalSize);
@@ -162,6 +162,73 @@ class CompressionService {
                 clearInterval(progressInterval);
             }
         }
+    }
+
+    static async spawnCompressionProcessWithCancellation(command, args, cancelCallback) {
+        return new Promise((resolve, reject) => {
+            const process = spawn(command, args, {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            let stdoutData = '';
+            let stderrData = '';
+
+            process.stdout.on('data', (data) => {
+                stdoutData += data;
+                console.log(`${command} stdout:`, data.toString());
+            });
+
+            process.stderr.on('data', (data) => {
+                stderrData += data;
+                console.error(`${command} stderr:`, data.toString());
+            });
+
+            process.on('close', (code) => {
+                if (code === 0) {
+                    resolve({ stdout: stdoutData, stderr: stderrData });
+                } else {
+                    let errorMessage = 'Compression failed';
+                    if (code === 255 && stderrData.includes('Break signaled')) {
+                        errorMessage = 'Compression was cancelled';
+                    } else if (stderrData.includes('No space left on device')) {
+                        errorMessage = 'Not enough disk space to complete compression';
+                    } else if (stderrData.includes('Permission denied')) {
+                        errorMessage = 'Permission denied while trying to compress files';
+                    } else {
+                        errorMessage = `Compression failed: ${stderrData.split('\n')[0]}`;
+                    }
+                    reject(new Error(errorMessage));
+                }
+            });
+
+            process.on('error', (err) => {
+                let errorMessage = 'Failed to start compression';
+                if (err.code === 'ENOENT') {
+                    errorMessage = `Compression tool '${command}' not found. Please ensure it is installed.`;
+                }
+                reject(new Error(errorMessage));
+            });
+
+            // Store the process so it can be killed later
+            this.currentProcess = process;
+
+            // Check for cancellation
+            if (cancelCallback) {
+                cancelCallback(() => {
+                    if (this.currentProcess) {
+                        console.log('Killing compression process...');
+                        try {
+                            this.currentProcess.kill('SIGTERM');
+                            this.currentProcess = null;
+                            reject(new Error('Compression cancelled'));
+                        } catch (error) {
+                            console.error('Error killing compression process:', error);
+                            reject(new Error('Compression failed'));
+                        }
+                    }
+                });
+            }
+        });
     }
 
     static getCompressionCommand(archiveType, filePaths, zipFilePath, compressionLevel) {
