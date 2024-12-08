@@ -11,6 +11,10 @@ const fileSchema = new mongoose.Schema({
     isPasswordProtected: { type: Boolean, default: false },
     password: { type: String, select: false }, // Will not be included in queries by default
     lastAccessed: { type: Date },
+    userAccess: [{
+        userId: { type: String, required: true },
+        lastAccessed: { type: Date, required: true }
+    }],
     createdAt: { type: Date, default: Date.now }
 });
 

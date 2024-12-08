@@ -29,9 +29,8 @@ exports.uploadFiles = async (req, res) => {
 exports.getFiles = async (req, res) => {
     try {
         const parentFolderId = req.query.parent_id || null;
-
         const files = await FileService.getFiles(req.userId, parentFolderId);
-        res.status(200).json(files);
+        res.json(files);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -80,7 +79,11 @@ exports.viewFile = async (req, res) => {
         });
 
     } catch (err) {
-        res.status(404).json({ error: err.message });
+        if (err.message === 'Password verification required') {
+            res.status(401).json({ error: err.message });
+        } else {
+            res.status(404).json({ error: err.message });
+        }
     }
 };
 
@@ -196,9 +199,9 @@ exports.stopCompression = async (req, res) => {
         const stopped = await FileService.stopCompression(req.userId, zipFileName, folder, parentId);
 
         if (stopped) {
-            res.status(200).json({ message: 'Compression process stopped successfully.' });
+            res.status(200).json({ success: true,message: 'Compression process stopped successfully.' });
         } else {
-            res.status(404).json({ error: 'No ongoing compression found for the specified file.' });
+            res.status(404).json({ success: false, error: 'No ongoing compression found for the specified file.' });
         }
     } catch (error) {
         console.error('Error stopping compression:', error);
@@ -374,8 +377,13 @@ exports.verifyPassword = async (req, res) => {
     try {
         const { itemId, password, isFolder } = req.body;
         const result = await FileService.verifyPassword(req.userId, itemId, password, isFolder);
-        res.json(result);
+        if (result) {
+            res.status(204).send();
+        } else {
+            res.status(401).json({ message: 'Invalid password' });
+        }
     } catch (error) {
-        res.status(400).json({ message: error.message });
+        console.error('Error verifying password:', error);
+        res.status(500).json({ message: 'Internal server error' });
     }
 };

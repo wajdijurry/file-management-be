@@ -147,13 +147,25 @@ class FileService {
             deleted: false
         });
 
-        // Add hasChildren field to folders
+        // Add hasChildren field to folders and check access status
         const foldersWithChildren = await Promise.all(folderRecords.map(async folder => {
             const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
-                             await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+                         await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+
+            // Check access status for password-protected folders
+            let isLocked = false;
+            if (folder.isPasswordProtected) {
+                const userAccess = folder.userAccess.find(
+                    access => access.userId === userId.toString()
+                );
+                const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
+                isLocked = !lastAccessed;
+            }
+
             return {
                 ...folder.toObject(),
-                hasChildren: childCount > 0
+                hasChildren: childCount > 0,
+                isLocked
             };
         }));
 
@@ -190,7 +202,7 @@ class FileService {
                     folderCount: folder.folderCount || 0,
                     path: folder.path,
                     hasChildren: folder.hasChildren,
-                    isLocked: folder.isPasswordProtected && !folder.lastAccessed,
+                    isLocked: folder.isLocked,
                     isPasswordProtected: folder.isPasswordProtected,
                     password: undefined
                 };
@@ -199,6 +211,16 @@ class FileService {
                 const filePath = path.join(uploadDirectory, fileRecord.path);
                 if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
                     return null; // Ignore if the file does not exist on disk
+                }
+
+                // Check access status for password-protected files
+                let isLocked = false;
+                if (fileRecord.isPasswordProtected) {
+                    const userAccess = fileRecord.userAccess.find(
+                        access => access.userId === userId.toString()
+                    );
+                    const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
+                    isLocked = !lastAccessed;
                 }
 
                 return {
@@ -210,7 +232,7 @@ class FileService {
                     mimetype: fileRecord.mimetype,
                     type: fileRecord.mimetype ? fileRecord.mimetype.split('/')[0] : 'unknown',
                     path: fileRecord.path,
-                    isLocked: fileRecord.isPasswordProtected && !fileRecord.lastAccessed,
+                    isLocked,
                     isPasswordProtected: fileRecord.isPasswordProtected,
                     password: undefined
                 };
@@ -384,7 +406,32 @@ class FileService {
     }
 
     static async viewFile(userId, fileId) {
-        const filePath = await this.getFile(userId, fileId);
+        const file = await this.getFileById(userId, fileId);
+        
+        if (!file) {
+            throw new Error('File not found');
+        }
+
+        // Check if file is password protected and not recently verified by this user
+        if (file.isPasswordProtected) {
+            const userAccess = file.userAccess.find(
+                access => access.userId === userId.toString()
+            );
+            
+            const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
+            const now = new Date();
+            
+            // Check if user hasn't accessed in the last 30 minutes
+            if (!lastAccessed || (now - lastAccessed) > 30 * 60 * 1000) {
+                throw new Error('Password verification required');
+            }
+        }
+
+        const filePath = path.join(this.uploadDirectory, file.path);
+        if (!fs.existsSync(filePath)) {
+            throw new Error('File not found on disk');
+        }
+
         const mimeType = mime.getType(filePath);
         return { filePath, mimeType };
     }
@@ -600,19 +647,38 @@ class FileService {
         const compression = this.ongoingCompressions.get(key);
 
         if (compression) {
-            const { abortController, archive } = compression;
+            const { abortController, activeArchive, output } = compression;
 
-            if (archive) {
-                archive.abort(); // Stop the archiver process
+            try {
+                // Kill the compression process first
+                const killed = CompressionService.killCurrentProcess();
+                console.log('Compression process killed:', killed);
+
+                if (activeArchive) {
+                    activeArchive.abort(); // Stop the archiver process
+                }
+
+                if (output) {
+                    output.destroy(); // Close the output stream
+                }
+
+                if (abortController) {
+                    abortController.abort(); // Signal other components to stop
+                }
+
+                // Delete the partial zip file if it exists
+                const zipFilePath = path.join(this.uploadDirectory, userId, zipFileName);
+                if (fs.existsSync(zipFilePath)) {
+                    await fs.unlink(zipFilePath);
+                }
+
+                this.ongoingCompressions.delete(key);
+                console.log(`Stopped compression for ${zipFileName}.`);
+                return true;
+            } catch (error) {
+                console.error(`Error stopping compression for ${zipFileName}:`, error);
+                throw error;
             }
-
-            if (abortController) {
-                abortController.abort(); // Signal other components to stop
-            }
-
-            this.ongoingCompressions.delete(key);
-            console.log(`Stopped compression for ${zipFileName}.`);
-            return true;
         }
 
         console.log(`No ongoing compression found for ${zipFileName}.`);
@@ -744,8 +810,8 @@ class FileService {
 
         if (isFolder) {
             // Find the folder by ID
-            item = await Folder.findById(itemId);
-            if (!item || item.userId !== userId) throw new Error('Folder not found or access denied');
+            item = await Folder.findOnBy({ _id: itemId, userId });
+            if (!item) throw new Error('Folder not found or access denied');
 
             // Set old and new paths for renaming
             oldPath = item.path;
@@ -785,7 +851,7 @@ class FileService {
 
         } else {
             // Find the file by ID
-            item = await File.findById(itemId);
+            item = await File.findBy({ _id: itemId, userId });
             if (!item || item.userId !== userId) throw new Error('File not found or access denied');
 
             // Set old and new paths for renaming
@@ -1241,32 +1307,101 @@ class FileService {
     }
 
     static async verifyPassword(userId, itemId, password, isFolder) {
-        try {
-            const Model = isFolder ? Folder : File;
-            const item = await Model.findOne({ 
-                _id: itemId, 
-                userId, 
-                deleted: false,
-                isPasswordProtected: true 
-            }).select('+password');
-
-            if (!item) {
-                throw new Error('Item not found or not password protected');
-            }
-
-            const isValid = await bcrypt.compare(password, item.password);
-            
-            if (isValid) {
-                item.lastAccessed = new Date();
-                item.isPasswordProtected = true; // Allow password removal after successful verification
-                await item.save();
-            }
-
-            return { success: isValid };
-        } catch (error) {
-            console.error('Error verifying password:', error.message);
-            throw error;
+        if (!itemId || !password) {
+            return false;
         }
+
+        try {
+            if (isFolder) {
+                const folder = await Folder.findOne({ _id: itemId, deleted: false }).select('+password');
+                if (!folder || !folder.isPasswordProtected) {
+                    return false;
+                }
+                
+                const isValid = await bcrypt.compare(password, folder.password);
+                if (!isValid) {
+                    return false;
+                }
+                
+                // Update or add user access record for folder
+                const userAccessIndex = folder.userAccess.findIndex(
+                    access => access.userId === userId.toString()
+                );
+                
+                if (userAccessIndex >= 0) {
+                    folder.userAccess[userAccessIndex].lastAccessed = new Date();
+                } else {
+                    folder.userAccess.push({
+                        userId,
+                        lastAccessed: new Date()
+                    });
+                }
+                
+                await folder.save();
+            } else {
+                const file = await File.findOne({ _id: itemId, deleted: false }).select('+password');
+                if (!file || !file.isPasswordProtected) {
+                    return false;
+                }
+                
+                const isValid = await bcrypt.compare(password, file.password);
+                if (!isValid) {
+                    return false;
+                }
+                
+                // Update or add user access record for file
+                const userAccessIndex = file.userAccess.findIndex(
+                    access => access.userId === userId.toString()
+                );
+                
+                if (userAccessIndex >= 0) {
+                    file.userAccess[userAccessIndex].lastAccessed = new Date();
+                } else {
+                    file.userAccess.push({
+                        userId,
+                        lastAccessed: new Date()
+                    });
+                }
+                
+                await file.save();
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('Error in verifyPassword:', error);
+            return false;
+        }
+    }
+
+    static async viewFile(userId, fileId) {
+        const file = await this.getFileById(userId, fileId);
+        
+        if (!file) {
+            throw new Error('File not found');
+        }
+
+        // Check if file is password protected and not recently verified by this user
+        if (file.isPasswordProtected) {
+            const userAccess = file.userAccess.find(
+                access => access.userId === userId.toString()
+            );
+            
+            const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
+            const now = new Date();
+            
+            // Check if user hasn't accessed in the last 30 minutes
+            if (!lastAccessed || (now - lastAccessed) > 30 * 60 * 1000) {
+                throw new Error('Password verification required');
+            }
+        }
+
+        const filePath = path.join(this.uploadDirectory, file.path);
+        if (!fs.existsSync(filePath)) {
+            throw new Error('File not found on disk');
+        }
+
+        const mimeType = mime.getType(filePath);
+        return { filePath, mimeType };
     }
 }
 
