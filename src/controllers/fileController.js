@@ -26,15 +26,38 @@ exports.uploadFiles = async (req, res) => {
 };
 
 // Get all files
+// exports.getFiles = async (req, res) => {
+//     try {
+//         const parentFolderId = req.query.parent_id || null;
+//         const files = await FileService.getFiles(req.userId, parentFolderId);
+//         res.json(files);
+//     } catch (err) {
+//         res.status(500).json({ error: err.message });
+//     }
+// };
+
 exports.getFiles = async (req, res) => {
+    const userId = req.userId; // Assuming authentication middleware
+    const parentId = req.query.parent_id || null;
+
     try {
-        const parentFolderId = req.query.parent_id || null;
-        const files = await FileService.getFiles(req.userId, parentFolderId);
-        res.json(files);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.write('['); // Start JSON array
+        let isFirst = true;
+
+        for await (const record of FileService.streamFilesGenerator(userId, parentId)) {
+            if (!isFirst) res.write(',');
+            res.write(JSON.stringify(record));
+            isFirst = false;
+        }
+
+        res.write(']'); // Close JSON array
+        res.end();
+    } catch (error) {
+        console.error('Error in getFiles controller:', error);
+        res.status(500).json({ error: 'Failed to fetch files and folders' });
     }
 };
+
 
 // Download file
 exports.downloadFile = async (req, res) => {
@@ -186,14 +209,14 @@ exports.compressFiles = async (req, res) => {
 
 exports.decompressFile = async (req, res) => {
     try {
-        const { filePath, targetFolder, merge, parentId } = req.body;
+        const { filePath, parentId } = req.body;
 
-        if (!filePath || !targetFolder) {
-            return res.status(400).json({ error: 'filePath and targetFolder are required' });
+        if (!filePath) {
+            return res.status(400).json({ error: 'filePath is required' });
         }
 
-        console.log('Decompressing file:', filePath, 'into folder:', targetFolder); // Debugging line
-        const result = await FileService.decompressFile(req.userId, filePath, targetFolder, parentId);
+        console.log('Decompressing file:', filePath, 'with parentId:', parentId); // Debugging line
+        const result = await FileService.decompressFile(req.userId, filePath, null, parentId);
         res.status(200).json(result);
     } catch (error) {
         console.error('Error decompressing file:', error);

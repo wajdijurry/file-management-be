@@ -139,134 +139,169 @@ class FileService {
         return totalSize;
     }
 
-    static async getFiles(userId, parentId = null) {
-        // Fetch folders and files from the database based on parent_id
-        const folderRecords = await Folder.find({
-            userId: userId,
-            parent_id: parentId,
-            deleted: false
-        });
+    static async *streamFilesGenerator(userId, parentId = null) {
+        try {
+            // Stream folders using a Mongoose cursor
+            const foldersStream = Folder.find({ userId, parent_id: parentId, deleted: false }).cursor();
 
-        // Add hasChildren field to folders and check access status
-        const foldersWithChildren = await Promise.all(folderRecords.map(async folder => {
-            const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
-                         await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+            for await (const folder of foldersStream) {
+                const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
+                    await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
 
-            // Check access status for password-protected folders
-            let isLocked = false;
-            if (folder.isPasswordProtected) {
-                const userAccess = folder.userAccess.find(
-                    access => access.userId === userId.toString()
-                );
-                const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
-                isLocked = !lastAccessed;
-            }
+                const isLocked = folder.isPasswordProtected &&
+                    !folder.userAccess.some(access => access.userId === userId.toString());
 
-            return {
-                ...folder.toObject(),
-                hasChildren: childCount > 0,
-                isLocked
-            };
-        }));
-
-        const fileRecords = await File.find({
-            userId: userId,
-            parent_id: parentId,
-            deleted: false
-        }).exec();
-
-        // Set the target path based on parentId, defaulting to the root upload directory
-        let uploadDirectory = this.uploadDirectory;
-
-        // Build the response data by fetching folders and files from disk
-        const filesAndFolders = await Promise.all([
-            ...foldersWithChildren.map(async folder => {
-                const folderPath = path.join(uploadDirectory, folder.path);
-                if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) {
-                    return null; // Ignore if the folder does not exist on disk
-                }
-
-                // Calculate folder size recursively if needed
-                const folderSize = FileService.calculateFolderSize(folderPath);
-                const stats = fs.statSync(folderPath);
-
-                return {
+                yield {
                     id: folder._id.toString(),
                     name: folder.name,
                     isFolder: true,
-                    size: folderSize,
-                    createdAt: stats.ctime,
-                    mimetype: '',
-                    type: 'folder',
-                    fileCount: folder.fileCount || 0,
-                    folderCount: folder.folderCount || 0,
-                    path: folder.path,
-                    hasChildren: folder.hasChildren,
-                    isLocked: folder.isLocked,
-                    isPasswordProtected: folder.isPasswordProtected,
-                    password: undefined
-                };
-            }),
-            ...fileRecords.map(fileRecord => {
-                const filePath = path.join(uploadDirectory, fileRecord.path);
-                if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-                    return null; // Ignore if the file does not exist on disk
-                }
-
-                // Check access status for password-protected files
-                let isLocked = false;
-                if (fileRecord.isPasswordProtected) {
-                    const userAccess = fileRecord.userAccess.find(
-                        access => access.userId === userId.toString()
-                    );
-                    const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
-                    isLocked = !lastAccessed;
-                }
-
-                return {
-                    id: fileRecord._id.toString(),
-                    name: fileRecord.name,
-                    isFolder: false,
-                    size: fileRecord.size,
-                    createdAt: fileRecord.createdAt,
-                    mimetype: fileRecord.mimetype,
-                    type: fileRecord.mimetype ? fileRecord.mimetype.split('/')[0] : 'unknown',
-                    path: fileRecord.path,
+                    hasChildren: childCount > 0,
                     isLocked,
-                    isPasswordProtected: fileRecord.isPasswordProtected,
-                    password: undefined
+                    isPasswordProtected: folder.isPasswordProtected,
+                    size: folder.size,  // Use the stored size from database
+                    createdAt: folder.createdAt,
+                    path: folder.path
                 };
-            })
-        ]);
+            }
 
-        // Filter out any null entries (e.g., missing files or folders on disk)
-        return filesAndFolders.filter(item => item);
+            // Stream files using another Mongoose cursor
+            const filesStream = File.find({ userId, parent_id: parentId, deleted: false }).cursor();
+
+            for await (const file of filesStream) {
+                const isLocked = file.isPasswordProtected &&
+                    !file.userAccess.some(access => access.userId === userId.toString());
+
+                yield {
+                    id: file._id.toString(),
+                    name: file.name,
+                    isFolder: false,
+                    size: file.size,
+                    createdAt: file.createdAt,
+                    mimetype: file.mimetype,
+                    type: file.mimetype ? file.mimetype.split('/')[0] : 'unknown',
+                    path: file.path,
+                    isLocked,
+                    isPasswordProtected: file.isPasswordProtected
+                };
+            }
+        } catch (error) {
+            console.error('Error streaming files:', error);
+            throw new Error('Failed to stream files and folders');
+        }
     }
 
-    static async getFileById(userId, id) {
-        return File.findOne({ _id: id, userId: userId, deleted: false });
+    static async updateFolderSize(folderId) {
+        const folder = await Folder.findById(folderId);
+        if (!folder) return;
+
+        const folderPath = path.join(this.uploadDirectory, folder.path);
+        if (fs.existsSync(folderPath)) {
+            const size = this.calculateFolderSize(folderPath);
+            await Folder.updateOne({ _id: folderId }, { size });
+
+            // Update parent folder sizes recursively
+            if (folder.parent_id) {
+                await this.updateFolderSize(folder.parent_id);
+            }
+        }
     }
 
-    static async getFile(userId, fileId) {
-        const file = await this.getFileById(userId, fileId);
-
-        if (!file) {
-            console.error(`File record not found in database for ID: ${fileId}`);
-            throw new Error('File not found');
+    static async recalculateFolderStats(folderId) {
+        if (!folderId || folderId === 'root') {
+            return;
         }
 
-        let filePath = path.join(this.uploadDirectory, file.path);
+        try {
+            // Find the folder
+            const folder = await Folder.findById(folderId);
+            if (!folder) return;
 
-        if (!fs.existsSync(filePath)) {
-            console.error(`File does not exist on disk: ${filePath}`);
-            throw new Error('File not found');
+            // Get all immediate children (files and folders)
+            const [files, subfolders] = await Promise.all([
+                File.find({ parent_id: folderId, deleted: false }),
+                Folder.find({ parent_id: folderId, deleted: false })
+            ]);
+
+            // Calculate stats
+            let totalSize = 0;
+            const fileCount = files.length;
+            const folderCount = subfolders.length;
+
+            // Sum up file sizes
+            totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
+
+            // Add subfolder sizes
+            for (const subfolder of subfolders) {
+                totalSize += subfolder.size || 0;
+            }
+
+            // Update folder stats
+            folder.size = totalSize;
+            folder.fileCount = fileCount;
+            folder.folderCount = folderCount;
+            await folder.save();
+
+            // Update parent folder if exists
+            if (folder.parent_id) {
+                await this.recalculateFolderStats(folder.parent_id);
+            }
+
+            return { totalSize, fileCount, folderCount };
+        } catch (error) {
+            console.error(`Error recalculating folder stats: ${error.message}`);
+            throw error;
         }
-
-        return filePath;
     }
 
-    static async getFileStream(filePath) {
-        return fs.createReadStream(filePath);
+    static async *streamFilesGenerator(userId, parentId = null) {
+        try {
+            // Stream folders using a Mongoose cursor
+            const foldersStream = Folder.find({ userId, parent_id: parentId, deleted: false }).cursor();
+
+            for await (const folder of foldersStream) {
+                const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
+                    await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
+
+                const isLocked = folder.isPasswordProtected &&
+                    !folder.userAccess.some(access => access.userId === userId.toString());
+
+                yield {
+                    id: folder._id.toString(),
+                    name: folder.name,
+                    isFolder: true,
+                    hasChildren: childCount > 0,
+                    isLocked,
+                    isPasswordProtected: folder.isPasswordProtected,
+                    size: folder.size,  // Use the stored size from database
+                    createdAt: folder.createdAt,
+                    path: folder.path
+                };
+            }
+
+            // Stream files using another Mongoose cursor
+            const filesStream = File.find({ userId, parent_id: parentId, deleted: false }).cursor();
+
+            for await (const file of filesStream) {
+                const isLocked = file.isPasswordProtected &&
+                    !file.userAccess.some(access => access.userId === userId.toString());
+
+                yield {
+                    id: file._id.toString(),
+                    name: file.name,
+                    isFolder: false,
+                    size: file.size,
+                    createdAt: file.createdAt,
+                    mimetype: file.mimetype,
+                    type: file.mimetype ? file.mimetype.split('/')[0] : 'unknown',
+                    path: file.path,
+                    isLocked,
+                    isPasswordProtected: file.isPasswordProtected
+                };
+            }
+        } catch (error) {
+            console.error('Error streaming files:', error);
+            throw new Error('Failed to stream files and folders');
+        }
     }
 
     static async deleteFile(userId, fileId) {
@@ -610,8 +645,19 @@ class FileService {
 
     static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
         const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
-        let targetDir = targetFolder === '.' ? rootDir : path.join(rootDir, targetFolder);
-        parentId = parentId ? parentId : null;
+        let targetDir;
+
+        if (parentId) {
+            // If parentId is provided, get the folder's path from the database
+            const parentFolder = await Folder.findById(parentId);
+            if (!parentFolder) {
+                throw new Error('Parent folder not found');
+            }
+            targetDir = path.join(this.uploadDirectory, parentFolder.path);
+        } else {
+            // If no parentId, use the root directory
+            targetDir = rootDir;
+        }
 
         zipFilePath = path.join(this.uploadDirectory, zipFilePath);
 
@@ -1111,70 +1157,70 @@ class FileService {
         return absolutePath;
     }
 
-    static async recalculateFolderStats(folderId)
-    {
-        if (!folderId || folderId === 'root') {
-            return;
-        }
+    // static async recalculateFolderStats(folderId)
+    // {
+    //     if (!folderId || folderId === 'root') {
+    //         return;
+    //     }
 
-        try {
-            let folder = null;
-            // Find the folder by its ID
-            if (folderId) {
-                folder = await Folder.findById(folderId);
-            }
+    //     try {
+    //         let folder = null;
+    //         // Find the folder by its ID
+    //         if (folderId) {
+    //             folder = await Folder.findById(folderId);
+    //         }
 
-            if (!folder) {
-                return;
-            }
+    //         if (!folder) {
+    //             return;
+    //         }
 
-            // Initialize counters
-            let totalSize = 0;
-            let fileCount = 0;
-            let folderCount = 0;
+    //         // Initialize counters
+    //         let totalSize = 0;
+    //         let fileCount = 0;
+    //         let folderCount = 0;
 
-            // Read folder contents from the file system
-            const folderPath = path.join(this.uploadDirectory, folder.path);
-            const contents = await fs.readdir(folderPath, { withFileTypes: true });
+    //         // Read folder contents from the file system
+    //         const folderPath = path.join(this.uploadDirectory, folder.path);
+    //         const contents = await fs.readdir(folderPath, { withFileTypes: true });
 
-            for (const item of contents) {
-                const itemPath = `${folderPath}/${item.name}`;
+    //         for (const item of contents) {
+    //             const itemPath = `${folderPath}/${item.name}`;
 
-                if (item.isFile()) {
-                    // Get file size
-                    const stats = await fs.stat(itemPath);
-                    totalSize += stats.size;
-                    fileCount++;
-                } else if (item.isDirectory()) {
-                    // Count folder and recursively calculate its stats
-                    folderCount++;
+    //             if (item.isFile()) {
+    //                 // Get file size
+    //                 const stats = await fs.stat(itemPath);
+    //                 totalSize += stats.size;
+    //                 fileCount++;
+    //             } else if (item.isDirectory()) {
+    //                 // Count folder and recursively calculate its stats
+    //                 folderCount++;
 
-                    // Find the child folder in the database and recalculate its stats
-                    const childFolder = await Folder.findOne({ path: itemPath });
-                    if (childFolder) {
-                        const childStats = await this.recalculateFolderStats(childFolder._id);
-                        totalSize += childStats.totalSize;
-                        fileCount += childStats.fileCount;
-                        folderCount += childStats.folderCount;
-                    }
-                }
-            }
+    //                 // Find the child folder in the database and recalculate its stats
+    //                 const childFolder = await Folder.findOne({ path: itemPath });
+    //                 if (childFolder) {
+    //                     const childStats = await this.recalculateFolderStats(childFolder._id);
+    //                     totalSize += childStats.totalSize;
+    //                     fileCount += childStats.fileCount;
+    //                     folderCount += childStats.folderCount;
+    //                 }
+    //             }
+    //         }
 
-            // Update the current folder stats
-            folder.size = totalSize;
-            folder.fileCount = fileCount;
-            folder.folderCount = folderCount;
-            await folder.save();
+    //         // Update the current folder stats
+    //         folder.size = totalSize;
+    //         folder.fileCount = fileCount;
+    //         folder.folderCount = folderCount;
+    //         await folder.save();
 
-            // Recalculate stats for parent folders if they exist
-            await this.recalculateFolderStats(folder.parent_id);
+    //         // Recalculate stats for parent folders if they exist
+    //         await this.recalculateFolderStats(folder.parent_id);
 
-            return { totalSize, fileCount, folderCount };
-        } catch (error) {
-            console.error(`Error recalculating folder stats: ${error.message}`);
-            throw error;
-        }
-    }
+    //         return { totalSize, fileCount, folderCount };
+    //     } catch (error) {
+    //         console.error(`Error recalculating folder stats: ${error.message}`);
+    //         throw error;
+    //     }
+    // }
 
     static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
         try {
