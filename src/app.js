@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const { init } = require('./socket');
 const fileRoutes = require('./routes/fileRoutes');
+const videoRoutes = require('./routes/videoRoutes');
+const imageRoutes = require('./routes/imageRoutes');
 const auth = require('./middlewares/auth');
 const authRoutes = require('./routes/authRoutes');
 const connectDB = require('./config/db');
@@ -66,4 +68,6 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Routes
 app.use('/api/files', auth, fileRoutes);
+app.use('/api/video', auth, videoRoutes);
+app.use('/api/image', auth, imageRoutes);
 app.use('/api/auth', authRoutes);

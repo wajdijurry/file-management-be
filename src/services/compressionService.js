@@ -1,6 +1,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { getIO } = require('../socket');
 
 class CompressionService {
     static currentProcess = null;
@@ -84,6 +85,12 @@ class CompressionService {
         
         // Check if compressed size is reasonable (allowing 20% overhead)
         if (stats.size > totalSize * 1.2) {
+            const io = getIO();
+            io.emit('compressionError', {
+                message: `Compressed file size (${stats.size}) is much larger than original size (${totalSize})`,
+                zipFilePath,
+                totalSize
+            });
             throw new Error(`Compressed file size (${stats.size}) is much larger than original size (${totalSize})`);
         }
         return stats.size;
