@@ -19,7 +19,8 @@ const {
     getFolderTree,
     setPassword,
     removePassword,
-    verifyPassword
+    verifyPassword,
+    searchItems
 } = require('../controllers/fileController');
 
 const multer = require('multer');
@@ -43,6 +44,9 @@ router.post('/file-size', getFileSize);
 router.get('/upload/status', getUploadStatus);
 router.post('/stop-compression', stopCompression);
 router.get('/folders/tree', getFolderTree);
+
+// Search files and folders
+router.get('/search', searchItems);
 
 // Password protection routes
 router.post('/password/set', setPassword);

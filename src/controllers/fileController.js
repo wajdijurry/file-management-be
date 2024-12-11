@@ -2,7 +2,7 @@ const FileService = require('../services/fileService');
 const path = require('path');
 const fs = require('fs');
 const { getIO } = require('../socket');
-const UploadProgress = require("../models/uplodPrgress");
+const SearchService = require('../services/searchService');
 
 exports.uploadFiles = async (req, res) => {
     try {
@@ -432,5 +432,24 @@ exports.verifyPassword = async (req, res) => {
     } catch (error) {
         console.error('Error verifying password:', error);
         res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+exports.searchItems = async (req, res) => {
+    try {
+        const { query } = req.query;
+        console.log('Search query:', query);
+        console.log('User:', req.userId);
+
+        if (!query) {
+            return res.status(400).json({ message: 'Search query is required' });
+        }
+
+        const results = await SearchService.searchItems(req.userId, query);
+        console.log('Search results:', results);
+        res.json({ results });
+    } catch (error) {
+        console.error('Search error:', error);
+        res.status(500).json({ message: 'Failed to search items' });
     }
 };

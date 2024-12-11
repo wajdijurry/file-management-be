@@ -115,13 +115,13 @@ class FileService {
                     if (!folder || folder.userId.toString() !== userId) {
                         throw new Error(`Folder not found or access denied: ${item.name}`);
                     }
-                    itemPath = path.join(this.uploadDirectory, userId, folder.path);
+                    itemPath = path.join(this.uploadDirectory, folder.path);
                 } else {
                     const file = await File.findById(item.id);
                     if (!file || file.userId.toString() !== userId) {
                         throw new Error(`File not found or access denied: ${item.name}`);
                     }
-                    itemPath = path.join(this.uploadDirectory, userId, file.path);
+                    itemPath = path.join(this.uploadDirectory, file.path);
                 }
 
                 const stats = fs.statSync(itemPath);
@@ -515,6 +515,7 @@ class FileService {
     static async compressFiles(userId, items, folder = '', zipFileName = null, parentId = null, progressCallback = null, archiveType = 'zip', compressionLevel = 6) {
         // Validate items exist and user has access
         const validatedItems = [];
+        const affectedFolders = new Set(); // Track folders that need size recalculation
 
         for (const itemId of items) {
             try {
@@ -522,6 +523,7 @@ class FileService {
                 let itemPath;
                 let itemType;
                 let itemName;
+                let itemParentId;
 
                 // Try to find the item as a file first
                 const file = await File.findById(itemId);
@@ -529,6 +531,7 @@ class FileService {
                     itemType = 'file';
                     itemPath = path.join(this.uploadDirectory, file.path);
                     itemName = file.name;
+                    itemParentId = file.parent_id;
                 } else {
                     // If not found as file, try as a folder
                     const folder = await Folder.findById(itemId);
@@ -536,9 +539,15 @@ class FileService {
                         itemType = 'folder';
                         itemPath = path.join(this.uploadDirectory, folder.path);
                         itemName = folder.name;
+                        itemParentId = folder.parent_id;
                     } else {
                         throw new Error(`Item not found or access denied: ${itemId}`);
                     }
+                }
+
+                // Add parent folder to affected folders list
+                if (itemParentId) {
+                    affectedFolders.add(itemParentId.toString());
                 }
 
                 // Verify path exists
@@ -568,7 +577,6 @@ class FileService {
         this.ongoingCompressions.set(key, { abortController, activeArchive: null, output: null });
 
         const signal = abortController.signal;
-        let output, archive;
 
         signal.addEventListener('abort', () => {
             console.log(`Aborting compression for ${zipFileName}.`);
@@ -614,33 +622,41 @@ class FileService {
 
         const filePaths = validatedItems.map(item => item.fullPath);
 
-        return CompressionService.compressFiles(filePaths, zipFilePath, archiveType, compressionLevel, progressCallback)
-            .then(result => {
-                const compressedFile = new File({
-                    name,
-                    path: path.join(userId, folder, name),
-                    size: result.archiveSize,
-                    mimetype: mimeType,
-                    createdAt: new Date(),
-                    deleted: false,
-                    userId: userId,
-                    parent_id: parentId
-                });
-
-                return compressedFile.save()
-                    .then(() => {
-                        return { success: true, file: compressedFile };
-                    });
-            })
-            .catch(error => {
-                console.error('Error in compression process:', error);
-                if (output) output.destroy();
-                if (fs.existsSync(zipFilePath)) {
-                    fs.unlink(zipFilePath, () => {});
-                }
-                this.ongoingCompressions.delete(key);
-                throw error;
+        try {
+            const result = await CompressionService.compressFiles(filePaths, zipFilePath, archiveType, compressionLevel, progressCallback);
+            
+            const compressedFile = new File({
+                name,
+                path: path.join(userId, folder, name),
+                size: result.archiveSize,
+                mimetype: mimeType,
+                createdAt: new Date(),
+                deleted: false,
+                userId: userId,
+                parent_id: parentId
             });
+
+            await compressedFile.save();
+
+            // Recalculate sizes for all affected folders
+            for (const folderId of affectedFolders) {
+                await this.recalculateFolderStats(folderId);
+            }
+
+            // If the compressed file was saved to a folder, recalculate that folder's size too
+            if (parentId) {
+                await this.recalculateFolderStats(parentId);
+            }
+
+            return { success: true, file: compressedFile };
+        } catch (error) {
+            console.error('Error in compression process:', error);
+            if (fs.existsSync(zipFilePath)) {
+                fs.unlink(zipFilePath, () => {});
+            }
+            this.ongoingCompressions.delete(key);
+            throw error;
+        }
     }
 
     static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
@@ -684,6 +700,11 @@ class FileService {
 
         // Save extracted contents
         await this.saveExtractedContentsInDb(rootDir, targetDir, userId, parentId, isRoot, extractedItems);
+
+        // Recalculate folder size after decompression
+        if (parentId) {
+            await this.recalculateFolderStats(parentId);
+        }
 
         return path.relative(this.uploadDirectory, targetDir);
     }
@@ -1157,71 +1178,6 @@ class FileService {
         return absolutePath;
     }
 
-    // static async recalculateFolderStats(folderId)
-    // {
-    //     if (!folderId || folderId === 'root') {
-    //         return;
-    //     }
-
-    //     try {
-    //         let folder = null;
-    //         // Find the folder by its ID
-    //         if (folderId) {
-    //             folder = await Folder.findById(folderId);
-    //         }
-
-    //         if (!folder) {
-    //             return;
-    //         }
-
-    //         // Initialize counters
-    //         let totalSize = 0;
-    //         let fileCount = 0;
-    //         let folderCount = 0;
-
-    //         // Read folder contents from the file system
-    //         const folderPath = path.join(this.uploadDirectory, folder.path);
-    //         const contents = await fs.readdir(folderPath, { withFileTypes: true });
-
-    //         for (const item of contents) {
-    //             const itemPath = `${folderPath}/${item.name}`;
-
-    //             if (item.isFile()) {
-    //                 // Get file size
-    //                 const stats = await fs.stat(itemPath);
-    //                 totalSize += stats.size;
-    //                 fileCount++;
-    //             } else if (item.isDirectory()) {
-    //                 // Count folder and recursively calculate its stats
-    //                 folderCount++;
-
-    //                 // Find the child folder in the database and recalculate its stats
-    //                 const childFolder = await Folder.findOne({ path: itemPath });
-    //                 if (childFolder) {
-    //                     const childStats = await this.recalculateFolderStats(childFolder._id);
-    //                     totalSize += childStats.totalSize;
-    //                     fileCount += childStats.fileCount;
-    //                     folderCount += childStats.folderCount;
-    //                 }
-    //             }
-    //         }
-
-    //         // Update the current folder stats
-    //         folder.size = totalSize;
-    //         folder.fileCount = fileCount;
-    //         folder.folderCount = folderCount;
-    //         await folder.save();
-
-    //         // Recalculate stats for parent folders if they exist
-    //         await this.recalculateFolderStats(folder.parent_id);
-
-    //         return { totalSize, fileCount, folderCount };
-    //     } catch (error) {
-    //         console.error(`Error recalculating folder stats: ${error.message}`);
-    //         throw error;
-    //     }
-    // }
-
     static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
         try {
             // Process the uploaded chunk (store to disk or database)
@@ -1446,6 +1402,11 @@ class FileService {
             throw new Error('File not found on disk');
         }
 
+        const mimeType = mime.getType(filePath);
+        return { filePath, mimeType };
+    }
+
+    static async getMimeType(filePath) {
         const mimeType = mime.getType(filePath);
         return { filePath, mimeType };
     }
