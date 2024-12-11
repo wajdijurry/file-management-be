@@ -471,6 +471,22 @@ class FileService {
         return { filePath, mimeType };
     }
 
+    static getFileStream(filePath) {
+        if (!fs.existsSync(filePath)) {
+            throw new Error('File not found on disk');
+        }
+        return fs.createReadStream(filePath);
+    }
+
+    static async getFileById(userId, fileId) {
+        const file = await File.findOne({ 
+            _id: fileId, 
+            userId: userId,
+            deleted: false 
+        });
+        return file;
+    }
+
     static async createFolder(userId, folderName, parent_id = null) {
         if (!userId || !folderName) {
             throw new Error('userId and folderName are required');
@@ -1373,37 +1389,6 @@ class FileService {
             console.error('Error in verifyPassword:', error);
             return false;
         }
-    }
-
-    static async viewFile(userId, fileId) {
-        const file = await this.getFileById(userId, fileId);
-        
-        if (!file) {
-            throw new Error('File not found');
-        }
-
-        // Check if file is password protected and not recently verified by this user
-        if (file.isPasswordProtected) {
-            const userAccess = file.userAccess.find(
-                access => access.userId === userId.toString()
-            );
-            
-            const lastAccessed = userAccess ? new Date(userAccess.lastAccessed) : null;
-            const now = new Date();
-            
-            // Check if user hasn't accessed in the last 30 minutes
-            if (!lastAccessed || (now - lastAccessed) > 30 * 60 * 1000) {
-                throw new Error('Password verification required');
-            }
-        }
-
-        const filePath = path.join(this.uploadDirectory, file.path);
-        if (!fs.existsSync(filePath)) {
-            throw new Error('File not found on disk');
-        }
-
-        const mimeType = mime.getType(filePath);
-        return { filePath, mimeType };
     }
 
     static async getMimeType(filePath) {
