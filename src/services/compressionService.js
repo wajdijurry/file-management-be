@@ -83,15 +83,13 @@ class CompressionService {
         const stats = fs.statSync(zipFilePath);
         console.log('Compressed file size:', stats.size, 'bytes');
         
-        // Check if compressed size is reasonable (allowing 20% overhead)
-        if (stats.size > totalSize * 1.2) {
-            const io = getIO();
-            io.emit('compressionError', {
-                message: `Compressed file size (${stats.size}) is much larger than original size (${totalSize})`,
-                zipFilePath,
-                totalSize
-            });
-            throw new Error(`Compressed file size (${stats.size}) is much larger than original size (${totalSize})`);
+        // For very small files (< 10KB), allow up to 10x size increase
+        // For larger files, allow up to 2x size increase
+        const sizeThreshold = 10 * 1024; // 10KB
+        const maxRatio = totalSize < sizeThreshold ? 10 : 2;
+        
+        if (stats.size > totalSize * maxRatio) {
+            console.warn(`Warning: Compressed file size (${stats.size}) is larger than expected (${totalSize})`);
         }
         return stats.size;
     }

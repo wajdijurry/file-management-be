@@ -26,25 +26,17 @@ exports.uploadFiles = async (req, res) => {
 };
 
 // Get all files
-// exports.getFiles = async (req, res) => {
-//     try {
-//         const parentFolderId = req.query.parent_id || null;
-//         const files = await FileService.getFiles(req.userId, parentFolderId);
-//         res.json(files);
-//     } catch (err) {
-//         res.status(500).json({ error: err.message });
-//     }
-// };
-
 exports.getFiles = async (req, res) => {
     const userId = req.userId; // Assuming authentication middleware
     const parentId = req.query.parent_id || null;
+    const search = req.query.search || null;
 
     try {
+        res.setHeader('Content-Type', 'application/json');
         res.write('['); // Start JSON array
         let isFirst = true;
 
-        for await (const record of FileService.streamFilesGenerator(userId, parentId)) {
+        for await (const record of FileService.streamFilesGenerator(userId, parentId, search)) {
             if (!isFirst) res.write(',');
             res.write(JSON.stringify(record));
             isFirst = false;
@@ -82,22 +74,22 @@ exports.viewFile = async (req, res) => {
             res.setHeader('Content-Disposition', 'inline');
         }
 
-        const fileStream = await FileService.getFileStream(filePath);
+        const { stream, mimetype } = await FileService.getFileStream(filePath);
 
-        if (!fileStream) {
+        if (!stream) {
             throw new Error('Failed to create file stream');
         }
 
-        fileStream.on('error', (error) => {
+        stream.on('error', (error) => {
             console.error('File streaming error:', error.message);
             res.status(500).send('File streaming error');
         });
 
-        fileStream.on('end', () => {
+        stream.on('end', () => {
             console.log('File stream ended');
         });
 
-        fileStream.pipe(res).on('finish', () => {
+        stream.pipe(res).on('finish', () => {
             console.log('Response stream finished');
         });
 

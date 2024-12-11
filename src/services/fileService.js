@@ -9,9 +9,8 @@ const extract = require('extract-zip');
 const { AbortController } = require('abort-controller');
 const AdmZip = require('adm-zip');
 const bcrypt = require('bcrypt');
-const Seven = require('node-7z');
-const { spawn } = require('child_process');
 const CompressionService = require('./compressionService');
+const socket = require('../socket');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -139,10 +138,25 @@ class FileService {
         return totalSize;
     }
 
-    static async *streamFilesGenerator(userId, parentId = null) {
+    static async *streamFilesGenerator(userId, parentId = null, search = null) {
         try {
+            let query = { 
+                userId, 
+                deleted: false
+            };
+
+            // Add parent_id filter only if not searching
+            if (!search && parentId !== undefined) {
+                query.parent_id = parentId || null;
+            }
+
+            // Add search filter if provided
+            if (search) {
+                query.name = new RegExp(search, 'i');
+            }
+
             // Stream folders using a Mongoose cursor
-            const foldersStream = Folder.find({ userId, parent_id: parentId, deleted: false }).cursor();
+            const foldersStream = Folder.find(query).cursor();
 
             for await (const folder of foldersStream) {
                 const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
@@ -165,7 +179,7 @@ class FileService {
             }
 
             // Stream files using another Mongoose cursor
-            const filesStream = File.find({ userId, parent_id: parentId, deleted: false }).cursor();
+            const filesStream = File.find(query).cursor();
 
             for await (const file of filesStream) {
                 const isLocked = file.isPasswordProtected &&
@@ -250,57 +264,6 @@ class FileService {
         } catch (error) {
             console.error(`Error recalculating folder stats: ${error.message}`);
             throw error;
-        }
-    }
-
-    static async *streamFilesGenerator(userId, parentId = null) {
-        try {
-            // Stream folders using a Mongoose cursor
-            const foldersStream = Folder.find({ userId, parent_id: parentId, deleted: false }).cursor();
-
-            for await (const folder of foldersStream) {
-                const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
-                    await File.countDocuments({ parent_id: folder._id.toString(), deleted: false });
-
-                const isLocked = folder.isPasswordProtected &&
-                    !folder.userAccess.some(access => access.userId === userId.toString());
-
-                yield {
-                    id: folder._id.toString(),
-                    name: folder.name,
-                    isFolder: true,
-                    hasChildren: childCount > 0,
-                    isLocked,
-                    isPasswordProtected: folder.isPasswordProtected,
-                    size: folder.size,  // Use the stored size from database
-                    createdAt: folder.createdAt,
-                    path: folder.path
-                };
-            }
-
-            // Stream files using another Mongoose cursor
-            const filesStream = File.find({ userId, parent_id: parentId, deleted: false }).cursor();
-
-            for await (const file of filesStream) {
-                const isLocked = file.isPasswordProtected &&
-                    !file.userAccess.some(access => access.userId === userId.toString());
-
-                yield {
-                    id: file._id.toString(),
-                    name: file.name,
-                    isFolder: false,
-                    size: file.size,
-                    createdAt: file.createdAt,
-                    mimetype: file.mimetype,
-                    type: file.mimetype ? file.mimetype.split('/')[0] : 'unknown',
-                    path: file.path,
-                    isLocked,
-                    isPasswordProtected: file.isPasswordProtected
-                };
-            }
-        } catch (error) {
-            console.error('Error streaming files:', error);
-            throw new Error('Failed to stream files and folders');
         }
     }
 
@@ -469,13 +432,6 @@ class FileService {
 
         const mimeType = mime.getType(filePath);
         return { filePath, mimeType };
-    }
-
-    static getFileStream(filePath) {
-        if (!fs.existsSync(filePath)) {
-            throw new Error('File not found on disk');
-        }
-        return fs.createReadStream(filePath);
     }
 
     static async getFileById(userId, fileId) {
@@ -677,158 +633,252 @@ class FileService {
 
     static async decompressFile(userId, zipFilePath, targetFolder = '.', parentId = null) {
         const rootDir = path.resolve(`${this.uploadDirectory}/${userId}`);
+        const io = socket.getIO();
         let targetDir;
+        let parentFolderId = parentId;
 
         if (parentId) {
-            // If parentId is provided, get the folder's path from the database
             const parentFolder = await Folder.findById(parentId);
             if (!parentFolder) {
                 throw new Error('Parent folder not found');
             }
             targetDir = path.join(this.uploadDirectory, parentFolder.path);
         } else {
-            // If no parentId, use the root directory
             targetDir = rootDir;
         }
 
         zipFilePath = path.join(this.uploadDirectory, zipFilePath);
 
-        // Prevent directory traversal attack
         if (!targetDir.startsWith(rootDir)) {
             throw new Error('Invalid target folder. Directory traversal is not allowed.');
         }
 
-        const isRoot = targetDir === rootDir;
+        // Step 1: Extract all files first (fast operation)
+        const zip = new AdmZip(zipFilePath);
+        const zipEntries = zip.getEntries();
+        const totalEntries = zipEntries.length;
+        let processedEntries = 0;
 
-        if (!isRoot) {
-            // Ensure the target directory exists
-            fs.mkdirSync(targetDir, {recursive: true});
+        // Process each entry individually
+        for (const entry of zipEntries) {
+            const normalizedPath = entry.entryName.replace(/\\/g, '/');
+            
+            // Extract the current entry maintaining the directory structure
+            if (!entry.isDirectory) {
+                zip.extractEntryTo(
+                    entry.entryName,    // Entry name with path
+                    targetDir,          // Target directory
+                    true,              // Maintain full path
+                    true               // Overwrite
+                );
+            }
+            
+            processedEntries++;
+            if (processedEntries % Math.max(1, Math.floor(totalEntries * 0.01)) === 0) {
+                const progress = Math.round((processedEntries / totalEntries) * 100);
+                io.emit('decompressionProgress', {
+                    userId,
+                    progress,
+                    fileName: path.basename(zipFilePath)
+                });
+            }
+        }
+        
+        // Step 2: Collect file and folder information
+        const folders = new Map();
+        const files = [];
+        
+        // First pass: collect all directories
+        for (const entry of zipEntries) {
+            const normalizedPath = entry.entryName.replace(/\\/g, '/');
+            
+            if (entry.isDirectory) {
+                const cleanPath = normalizedPath.replace(/\/$/, '');
+                const parts = cleanPath.split('/');
+                let currentPath = '';
+                
+                for (let i = 0; i < parts.length; i++) {
+                    const part = parts[i];
+                    const prevPath = currentPath;
+                    currentPath = parts.slice(0, i + 1).join('/');
+                    
+                    if (!folders.has(currentPath)) {
+                        folders.set(currentPath, {
+                            name: part,
+                            fullPath: currentPath,
+                            parent: prevPath || null
+                        });
+                    }
+                }
+            } else {
+                const dirPath = path.dirname(normalizedPath);
+                if (dirPath !== '.' && !folders.has(dirPath)) {
+                    const parts = dirPath.split('/');
+                    let currentPath = '';
+                    
+                    for (let i = 0; i < parts.length; i++) {
+                        const part = parts[i];
+                        const prevPath = currentPath;
+                        currentPath = parts.slice(0, i + 1).join('/');
+                        
+                        if (!folders.has(currentPath)) {
+                            folders.set(currentPath, {
+                                name: part,
+                                fullPath: currentPath,
+                                parent: prevPath || null
+                            });
+                        }
+                    }
+                }
+                
+                files.push({
+                    path: normalizedPath,
+                    name: path.basename(normalizedPath),
+                    parent: dirPath === '.' ? null : dirPath
+                });
+            }
         }
 
-        const extractedItems = [];
+        // Step 3: Create folders in correct order
+        const folderCache = new Map();
+        const sortedFolders = Array.from(folders.values())
+            .sort((a, b) => a.fullPath.split('/').length - b.fullPath.split('/').length);
 
-        await extract(zipFilePath, {
-            dir: targetDir,
-            onEntry: async (entry) => {
-                extractedItems.push(entry.fileName);
-            },
+        // Create folders
+        for (const folder of sortedFolders) {
+            let parentId = parentFolderId;
+
+            if (folder.parent) {
+                const parentFolder = folderCache.get(folder.parent);
+                if (parentFolder) {
+                    parentId = parentFolder._id;
+                }
+            }
+
+            const newFolder = new Folder({
+                name: folder.name,
+                path: path.join(userId, folder.fullPath),
+                parent_id: parentId,
+                userId
+            });
+
+            await newFolder.save();
+            folderCache.set(folder.fullPath, newFolder);
+        }
+
+        // Step 4: Create files with correct parent folders
+        const filePromises = files.map(async file => {
+            let parentId = parentFolderId;
+
+            if (file.parent) {
+                const parentFolder = folderCache.get(file.parent);
+                if (parentFolder) {
+                    parentId = parentFolder._id;
+                }
+            }
+            
+            const fullPath = path.join(targetDir, file.path);
+            const stats = fs.statSync(fullPath);
+
+            return new File({
+                name: file.name,
+                path: path.join(userId, file.path),
+                parent_id: parentId,
+                size: stats.size,
+                mimetype: mime.getType(file.path) || 'application/octet-stream',
+                userId
+            });
         });
 
-        // Save extracted contents
-        await this.saveExtractedContentsInDb(rootDir, targetDir, userId, parentId, isRoot, extractedItems);
+        // Save files in batches of 100
+        const batchSize = 100;
+        for (let i = 0; i < filePromises.length; i += batchSize) {
+            const batch = filePromises.slice(i, i + batchSize);
+            const files = await Promise.all(batch);
+            await File.insertMany(files);
+        }
 
-        // Recalculate folder size after decompression
-        if (parentId) {
-            await this.recalculateFolderStats(parentId);
+        // Step 5: Recalculate folder sizes
+        const allFolderIds = Array.from(folderCache.values()).map(f => f._id);
+        if (parentFolderId) {
+            allFolderIds.push(parentFolderId);
+        }
+
+        // Recalculate sizes for all folders from bottom up
+        const sortedForSizes = allFolderIds.sort((a, b) => {
+            const folderA = Array.from(folderCache.values()).find(f => f._id.equals(a));
+            const folderB = Array.from(folderCache.values()).find(f => f._id.equals(b));
+            return (folderB?.path.split('/').length || 0) - (folderA?.path.split('/').length || 0);
+        });
+
+        for (const folderId of sortedForSizes) {
+            this.recalculateFolderStats(folderId);
         }
 
         return path.relative(this.uploadDirectory, targetDir);
     }
 
-    static async stopCompression(userId, zipFileName) {
-        const key = `${userId}-${zipFileName}`;
-        const compression = this.ongoingCompressions.get(key);
+    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentId = null, isRoot = false, items = []) {
+        const folderCache = new Map();
 
-        if (compression) {
-            const { abortController, activeArchive, output } = compression;
-
-            try {
-                // Kill the compression process first
-                const killed = CompressionService.killCurrentProcess();
-                console.log('Compression process killed:', killed);
-
-                if (activeArchive) {
-                    activeArchive.abort(); // Stop the archiver process
-                }
-
-                if (output) {
-                    output.destroy(); // Close the output stream
-                }
-
-                if (abortController) {
-                    abortController.abort(); // Signal other components to stop
-                }
-
-                // Delete the partial zip file if it exists
-                const zipFilePath = path.join(this.uploadDirectory, userId, zipFileName);
-                if (fs.existsSync(zipFilePath)) {
-                    await fs.unlink(zipFilePath);
-                }
-
-                this.ongoingCompressions.delete(key);
-                console.log(`Stopped compression for ${zipFileName}.`);
-                return true;
-            } catch (error) {
-                console.error(`Error stopping compression for ${zipFileName}:`, error);
-                throw error;
+        // Helper function to ensure folder exists and get its ID
+        const ensureFolder = async (folderPath, parentId = null) => {
+            const fullPath = path.join(userId, folderPath);
+            
+            if (folderCache.has(fullPath)) {
+                return folderCache.get(fullPath);
             }
-        }
 
-        console.log(`No ongoing compression found for ${zipFileName}.`);
-        return false;
-    }
-
-    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentFolderId = null, isRoot = false, items = []) {
-        // Calculate the relative path from the root directory
-        const relativeFolderPath = path.relative(rootDir, currentPath);
-        const fullFolderPath = isRoot
-            ? userId // If root, only use the userId as the base path
-            : path.join(userId, relativeFolderPath); // Prefix with userId for non-root folders
-
-        let folderDoc;
-
-        // Only create a folder if it’s not the root or explicitly required
-        if (!isRoot || relativeFolderPath) {
-            folderDoc = await Folder.findOne({ path: fullFolderPath, userId, deleted: false });
-
-            if (!folderDoc) {
-                folderDoc = new Folder({
-                    name: isRoot ? userId : path.basename(currentPath), // Use userId only for root
-                    path: fullFolderPath,
-                    parent_id: isRoot ? null : parentFolderId, // Root has no parent
+            let folder = await Folder.findOne({ path: fullPath, userId, deleted: false });
+            if (!folder) {
+                folder = new Folder({
+                    name: path.basename(folderPath.replace(/\/$/, '')), // Remove trailing slash for name
+                    path: fullPath,
+                    parent_id: parentId,
                     userId,
                 });
-                await folderDoc.save();
+                await folder.save();
+            }
+            
+            folderCache.set(fullPath, folder);
+            return folder;
+        };
+
+        // Process all items
+        for (const itemPath of items) {
+            const isDirectory = itemPath.endsWith('/');
+            const relativePath = itemPath.replace(/^\/+/, ''); // Remove leading slashes
+            const pathParts = relativePath.split('/').filter(Boolean);
+            
+            // Skip empty paths
+            if (pathParts.length === 0) continue;
+
+            let currentParentId = parentId;
+            let currentPath = '';
+
+            // Create/ensure all parent folders exist
+            for (let i = 0; i < (isDirectory ? pathParts.length : pathParts.length - 1); i++) {
+                currentPath = pathParts.slice(0, i + 1).join('/');
+                const folder = await ensureFolder(currentPath, currentParentId);
+                currentParentId = folder._id;
             }
 
-            // Update parentFolderId for nested items
-            parentFolderId = folderDoc._id;
-        }
+            // If it's a file, create the file document
+            if (!isDirectory) {
+                const fileName = pathParts[pathParts.length - 1];
+                const fullFilePath = path.join(userId, relativePath);
+                const absoluteFilePath = path.join(currentPath, itemPath);
 
-        for (const item of items) {
-            const absoluteItemPath = path.join(currentPath, item);
-            const stats = fs.statSync(absoluteItemPath);
+                // Only create file if it doesn't exist
+                const existingFile = await File.findOne({ path: fullFilePath, userId, deleted: false });
+                if (!existingFile) {
+                    const stats = fs.statSync(path.join(rootDir, relativePath));
+                    const mimeType = mime.getType(fileName) || 'application/octet-stream';
 
-            if (stats.isDirectory()) {
-                // Recursively handle subdirectories
-                await this.saveExtractedContentsInDb(
-                    rootDir,
-                    absoluteItemPath,
-                    userId,
-                    parentFolderId,
-                    false // Subdirectories are not root
-                );
-            } else {
-                // Handle files
-                const relativeFilePath = path.relative(rootDir, absoluteItemPath);
-                const fullFilePath = path.join(userId, relativeFilePath); // Prefix with userId for full path
-
-                // Get relative folder path and remove file name
-                let folderDbRelativePath = relativeFilePath.split('/');
-                folderDbRelativePath.pop();
-                folderDbRelativePath = path.join(userId, folderDbRelativePath.join('/'));
-
-                folderDoc = await Folder.findOne({ path: folderDbRelativePath, userId, deleted: false });
-
-                // Check or create the file document
-                let fileDoc = await File.findOne({ path: fullFilePath, userId, deleted: false });
-                if (!fileDoc) {
-                    const mimeType = mime.getType(absoluteItemPath) || 'application/octet-stream';
-
-                    fileDoc = new File({
-                        name: path.basename(absoluteItemPath),
+                    const fileDoc = new File({
+                        name: fileName,
                         path: fullFilePath,
-                        parent_id: folderDoc ? folderDoc._id : parentFolderId,
+                        parent_id: currentParentId,
                         size: stats.size,
                         mimetype: mimeType,
                         userId,
@@ -880,6 +930,65 @@ class FileService {
         });
     }
 
+    static async stopCompression(userId, zipFileName) {
+        const key = `${userId}-${zipFileName}`;
+        const compression = this.ongoingCompressions.get(key);
+
+        if (compression) {
+            const { abortController, activeArchive, output } = compression;
+
+            try {
+                // Kill the compression process first
+                const killed = CompressionService.killCurrentProcess();
+                console.log('Compression process killed:', killed);
+
+                if (activeArchive) {
+                    activeArchive.abort(); // Stop the archiver process
+                }
+
+                if (output) {
+                    output.destroy(); // Close the output stream
+                }
+
+                if (abortController) {
+                    abortController.abort(); // Signal other components to stop
+                }
+
+                // Delete the partial zip file if it exists
+                const zipFilePath = path.join(this.uploadDirectory, userId, zipFileName);
+                if (fs.existsSync(zipFilePath)) {
+                    await fs.unlink(zipFilePath);
+                }
+
+                this.ongoingCompressions.delete(key);
+                console.log(`Stopped compression for ${zipFileName}.`);
+                return true;
+            } catch (error) {
+                console.error(`Error stopping compression for ${zipFileName}:`, error);
+                throw error;
+            }
+        }
+
+        console.log(`No ongoing compression found for ${zipFileName}.`);
+        return false;
+    }
+
+    static async updateFolderSize(folderId) {
+        const folder = await Folder.findById(folderId);
+        if (!folder) return;
+
+        const folderPath = path.join(this.uploadDirectory, folder.path);
+        if (fs.existsSync(folderPath)) {
+            const size = this.calculateFolderSize(folderPath);
+            await Folder.updateOne({ _id: folderId }, { size });
+
+            // Update parent folder sizes recursively
+            if (folder.parent_id) {
+                await this.updateFolderSize(folder.parent_id);
+            }
+        }
+    }
+
     static async renameItem(userId, itemId, newName, isFolder) {
         if (!userId || !itemId || !newName) {
             throw new Error('userId, itemId, and newName are required');
@@ -916,14 +1025,14 @@ class FileService {
             const newPathSegment = newPath;
 
             // Find and update child folders
-            const childFolders = await Folder.find({ userId, path: new RegExp(`^${oldPathSegment}/`) });
+            const childFolders = await Folder.find({path: new RegExp(`^${oldPathSegment}/`)});
             const updateFolderPromises = childFolders.map(folder => {
                 folder.path = folder.path.replace(oldPathSegment, newPathSegment);
                 return folder.save();
             });
 
             // Find and update child files
-            const childFiles = await File.find({ userId, path: new RegExp(`^${oldPathSegment}/`)});
+            const childFiles = await File.find({path: new RegExp(`^${oldPathSegment}/`)});
             const updateFilePromises = childFiles.map(file => {
                 file.path = file.path.replace(oldPathSegment, newPathSegment);
                 return file.save();
@@ -1184,6 +1293,23 @@ class FileService {
             fs.rmSync(folderPath, { recursive: true, force: true });
         }
         await Folder.deleteOne({ _id: folderId });
+    }
+
+    static async getFileStream(filePath) {
+        try {
+            // Check if file exists
+            await fs.access(filePath);
+            
+            // Create read stream
+            const stream = fs.createReadStream(filePath);
+            
+            return {
+                stream,
+                mimetype: mime.getType(filePath)
+            };
+        } catch (error) {
+            throw new Error('File not found or inaccessible');
+        }
     }
 
     static prepareDownload(filePath) {
