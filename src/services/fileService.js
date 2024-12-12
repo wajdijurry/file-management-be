@@ -11,6 +11,7 @@ const AdmZip = require('adm-zip');
 const bcrypt = require('bcrypt');
 const CompressionService = require('./compressionService');
 const socket = require('../socket');
+const VirusScanner = require('./virusScanner');
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
@@ -777,17 +778,25 @@ class FileService {
                 }
             }
             
-            const fullPath = path.join(targetDir, file.path);
-            const stats = fs.statSync(fullPath);
+            const fullPath = path.join(userId, file.path);
+            const absoluteFilePath = path.join(targetDir, file.path);
 
-            return new File({
-                name: file.name,
-                path: path.join(userId, file.path),
-                parent_id: parentId,
-                size: stats.size,
-                mimetype: mime.getType(file.path) || 'application/octet-stream',
-                userId
-            });
+            // Only create file if it doesn't exist
+            const existingFile = await File.findOne({ path: fullPath, userId, deleted: false });
+            if (!existingFile) {
+                const stats = fs.statSync(absoluteFilePath);
+                const mimeType = mime.getType(file.path) || 'application/octet-stream';
+
+                const fileDoc = new File({
+                    name: file.name,
+                    path: fullPath,
+                    parent_id: parentId,
+                    size: stats.size,
+                    mimetype: mimeType,
+                    userId,
+                });
+                await fileDoc.save();
+            }
         });
 
         // Save files in batches of 100
@@ -1322,6 +1331,9 @@ class FileService {
 
     static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
         try {
+            // Scan the chunk for viruses first
+            await VirusScanner.scanBuffer(chunk.buffer, filename);
+            
             // Process the uploaded chunk (store to disk or database)
             await this.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
 
@@ -1343,8 +1355,26 @@ class FileService {
                 uploadProgress.delete();
             }
         } catch (error) {
-            console.error('Error processing chunk or tracking progress:', error.message);
-            throw new Error('Failed to process chunk or track progress');
+            if (error.message.includes('Virus detected')) {
+                // Clean up any partially uploaded chunks
+                await cleanupPartialUpload(userId, filename);
+                throw new Error('File rejected: Virus detected');
+            }
+            throw error;
+        }
+    }
+
+    static async cleanupPartialUpload(userId, filename) {
+        try {
+            // Add cleanup logic here for partial uploads
+            // This might include removing temporary files and database records
+            const uploadProgress = await UploadProgress.findOne({ userId, filename });
+            if (uploadProgress) {
+                await uploadProgress.remove();
+            }
+            // Add any additional cleanup needed
+        } catch (error) {
+            console.error('Error cleaning up partial upload:', error);
         }
     }
 
