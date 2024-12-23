@@ -9,6 +9,7 @@ const authRoutes = require('./routes/authRoutes');
 const connectDB = require('./config/db');
 const http = require('http');
 const scheduleAccessTimeout = require('./schedulers/accessTimeoutScheduler');
+const ScanningService = require('./services/scanningService');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,7 +17,16 @@ const PORT = process.env.PORT || 3000;
 const corsOptions = {
     origin: 'http://localhost:8082',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with', 'Range'],
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'x-requested-with',
+        'Range',
+        'X-File-Id',
+        'X-File-Name',
+        'X-Chunk-Index',
+        'X-Total-Chunks'
+    ],
     optionsSuccessStatus: 200
 };
 
@@ -36,6 +46,10 @@ app.use(express.urlencoded({ extended: true }));
 
 // Connect to MongoDB
 connectDB().then(() => {
+    // Initialize virus scanning service
+    ScanningService.initialize();
+    console.log('Virus scanning service initialized');
+    
     // Start the scheduler after database connection is established
     scheduleAccessTimeout();
     

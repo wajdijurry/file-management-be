@@ -11,14 +11,14 @@ const AdmZip = require('adm-zip');
 const bcrypt = require('bcrypt');
 const CompressionService = require('./compressionService');
 const socket = require('../socket');
-const VirusScanner = require('./virusScanner');
+const { fileEvents, EVENT_TYPES } = require('./eventService');
+const config = require('../config'); // Import config
 
 class FileService {
     static uploadDirectory = path.join(__dirname, '../../public/uploads');
     static ongoingCompressions = new Map();
 
-    static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks)
-    {
+    static async uploadFile(userId, fileName, folderId = null, chunk, currentChunk, totalChunks) {
         let uploadDir = FileService.uploadDirectory;
         let relativeUploadDir = '';
 
@@ -47,7 +47,7 @@ class FileService {
 
         // If all chunks are uploaded, combine them
         if (parseInt(currentChunk) >= parseInt(totalChunks)) {
-            await FileService.combineChunks(chunkDir, uploadDir, relativeUploadDir, fileName, userId, folderId);
+            return await this.combineChunks(chunkDir, uploadDir, relativeUploadDir, fileName, userId, folderId);
         }
     }
 
@@ -55,10 +55,10 @@ class FileService {
         try {
             const targetPath = path.join(uploadDir, filename);
             const chunks = fs.readdirSync(chunkDir).sort((a, b) => {
-                const aNum = parseInt(a.split('_')[1]);
-                const bNum = parseInt(b.split('_')[1]);
-                return aNum - bNum;
-            });
+                    const aNum = parseInt(a.split('_')[1]);
+                    const bNum = parseInt(b.split('_')[1]);
+                    return aNum - bNum;
+                });
 
             // Create write stream for the target file
             const writeStream = fs.createWriteStream(targetPath);
@@ -72,14 +72,23 @@ class FileService {
 
             writeStream.end();
 
-            await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream);
+            const file = await this.saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream);
 
             this.recalculateFolderStats(parentId);
 
             // Remove the chunks directory
             fs.rmdirSync(chunkDir);
 
+            // Emit file uploaded event after file is saved
+            fileEvents.emit(EVENT_TYPES.FILE_UPLOADED, {
+                fileId: file._id,
+                userId,
+                filePath: file.path
+            });
+
             console.log(`File ${filename} successfully combined and saved.`);
+
+            return file;
         } catch (error) {
             console.error('Error combining chunks:', error);
             throw new Error('Failed to combine file chunks');
@@ -141,23 +150,30 @@ class FileService {
 
     static async *streamFilesGenerator(userId, parentId = null, search = null) {
         try {
-            let query = { 
+            let foldersQuery = { 
                 userId, 
                 deleted: false
             };
 
+            let filesQuery = {
+                userId,
+                deleted: false,
+                scanStatus: {$in: [null, 'clean']}
+            };
+
             // Add parent_id filter only if not searching
             if (!search && parentId !== undefined) {
-                query.parent_id = parentId || null;
+                foldersQuery.parent_id = parentId || null;
+                filesQuery.parent_id = parentId || null;
             }
 
             // Add search filter if provided
             if (search) {
-                query.name = new RegExp(search, 'i');
+                foldersQuery.name = new RegExp(search, 'i');
             }
 
             // Stream folders using a Mongoose cursor
-            const foldersStream = Folder.find(query).cursor();
+            const foldersStream = Folder.find(foldersQuery).cursor();
 
             for await (const folder of foldersStream) {
                 const childCount = await Folder.countDocuments({ parent_id: folder._id.toString(), deleted: false }) +
@@ -180,7 +196,7 @@ class FileService {
             }
 
             // Stream files using another Mongoose cursor
-            const filesStream = File.find(query).cursor();
+            const filesStream = File.find(filesQuery).cursor();
 
             for await (const file of filesStream) {
                 const isLocked = file.isPasswordProtected &&
@@ -637,6 +653,7 @@ class FileService {
         const io = socket.getIO();
         let targetDir;
         let parentFolderId = parentId;
+        let parentFolderPath = '';
 
         if (parentId) {
             const parentFolder = await Folder.findById(parentId);
@@ -644,8 +661,10 @@ class FileService {
                 throw new Error('Parent folder not found');
             }
             targetDir = path.join(this.uploadDirectory, parentFolder.path);
+            parentFolderPath = parentFolder.path;
         } else {
             targetDir = rootDir;
+            parentFolderPath = userId;
         }
 
         zipFilePath = path.join(this.uploadDirectory, zipFilePath);
@@ -756,9 +775,11 @@ class FileService {
                 }
             }
 
+            console.log(`Creating folder`, folder);
+
             const newFolder = new Folder({
                 name: folder.name,
-                path: path.join(userId, folder.fullPath),
+                path: path.join(parentFolderPath, folder.fullPath),
                 parent_id: parentId,
                 userId
             });
@@ -778,7 +799,7 @@ class FileService {
                 }
             }
             
-            const fullPath = path.join(userId, file.path);
+            const fullPath = path.join(parentFolderPath, file.path);
             const absoluteFilePath = path.join(targetDir, file.path);
 
             // Only create file if it doesn't exist
@@ -787,24 +808,29 @@ class FileService {
                 const stats = fs.statSync(absoluteFilePath);
                 const mimeType = mime.getType(file.path) || 'application/octet-stream';
 
-                const fileDoc = new File({
+                console.log(`Creating file`, file.name);
+
+                return {
                     name: file.name,
                     path: fullPath,
                     parent_id: parentId,
                     size: stats.size,
                     mimetype: mimeType,
                     userId,
-                });
-                await fileDoc.save();
+                };
             }
+            return null;
         });
 
         // Save files in batches of 100
         const batchSize = 100;
         for (let i = 0; i < filePromises.length; i += batchSize) {
             const batch = filePromises.slice(i, i + batchSize);
-            const files = await Promise.all(batch);
-            await File.insertMany(files);
+            const files = (await Promise.all(batch)).filter(file => file !== null);
+            if (files.length > 0) {
+                console.log(files);
+                await File.insertMany(files);
+            }
         }
 
         // Step 5: Recalculate folder sizes
@@ -825,77 +851,6 @@ class FileService {
         }
 
         return path.relative(this.uploadDirectory, targetDir);
-    }
-
-    static async saveExtractedContentsInDb(rootDir, currentPath, userId, parentId = null, isRoot = false, items = []) {
-        const folderCache = new Map();
-
-        // Helper function to ensure folder exists and get its ID
-        const ensureFolder = async (folderPath, parentId = null) => {
-            const fullPath = path.join(userId, folderPath);
-            
-            if (folderCache.has(fullPath)) {
-                return folderCache.get(fullPath);
-            }
-
-            let folder = await Folder.findOne({ path: fullPath, userId, deleted: false });
-            if (!folder) {
-                folder = new Folder({
-                    name: path.basename(folderPath.replace(/\/$/, '')), // Remove trailing slash for name
-                    path: fullPath,
-                    parent_id: parentId,
-                    userId,
-                });
-                await folder.save();
-            }
-            
-            folderCache.set(fullPath, folder);
-            return folder;
-        };
-
-        // Process all items
-        for (const itemPath of items) {
-            const isDirectory = itemPath.endsWith('/');
-            const relativePath = itemPath.replace(/^\/+/, ''); // Remove leading slashes
-            const pathParts = relativePath.split('/').filter(Boolean);
-            
-            // Skip empty paths
-            if (pathParts.length === 0) continue;
-
-            let currentParentId = parentId;
-            let currentPath = '';
-
-            // Create/ensure all parent folders exist
-            for (let i = 0; i < (isDirectory ? pathParts.length : pathParts.length - 1); i++) {
-                currentPath = pathParts.slice(0, i + 1).join('/');
-                const folder = await ensureFolder(currentPath, currentParentId);
-                currentParentId = folder._id;
-            }
-
-            // If it's a file, create the file document
-            if (!isDirectory) {
-                const fileName = pathParts[pathParts.length - 1];
-                const fullFilePath = path.join(userId, relativePath);
-                const absoluteFilePath = path.join(currentPath, itemPath);
-
-                // Only create file if it doesn't exist
-                const existingFile = await File.findOne({ path: fullFilePath, userId, deleted: false });
-                if (!existingFile) {
-                    const stats = fs.statSync(path.join(rootDir, relativePath));
-                    const mimeType = mime.getType(fileName) || 'application/octet-stream';
-
-                    const fileDoc = new File({
-                        name: fileName,
-                        path: fullFilePath,
-                        parent_id: currentParentId,
-                        size: stats.size,
-                        mimetype: mimeType,
-                        userId,
-                    });
-                    await fileDoc.save();
-                }
-            }
-        }
     }
 
     static async saveFileMetadata(targetPath, userId, filename, parentId, relativeUploadDir, writeStream)
@@ -928,6 +883,7 @@ class FileService {
                             mimetype: mimeType,
                             createdAt: new Date(),
                             deleted: false,
+                            scanStatus: config.virusScanning?.enabled ? 'pending' : 'clean' // Set as clean if scanning disabled
                         });
 
                         await file.save();
@@ -1331,11 +1287,8 @@ class FileService {
 
     static async processChunkAndTrackProgress(userId, filename, folderId, chunk, currentChunk, totalChunks) {
         try {
-            // Scan the chunk for viruses first
-            await VirusScanner.scanBuffer(chunk.buffer, filename);
-            
             // Process the uploaded chunk (store to disk or database)
-            await this.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
+            const file = await this.uploadFile(userId, filename, folderId, chunk, currentChunk, totalChunks);
 
             // Track uploaded chunk progress
             const chunkIndex = parseInt(currentChunk, 10);
@@ -1351,13 +1304,15 @@ class FileService {
                 await uploadProgress.save();
             }
 
-            if (currentChunk >= totalChunks && uploadProgress) {
-                uploadProgress.delete();
+            if (parseInt(currentChunk) >= parseInt(totalChunks) - 1) {
+                await uploadProgress.deleteOne();
             }
+
+            return file;
         } catch (error) {
             if (error.message.includes('Virus detected')) {
                 // Clean up any partially uploaded chunks
-                await cleanupPartialUpload(userId, filename);
+                await this.cleanupPartialUpload(userId, filename);
                 throw new Error('File rejected: Virus detected');
             }
             throw error;

@@ -11,12 +11,25 @@ const fileSchema = new mongoose.Schema({
     isPasswordProtected: { type: Boolean, default: false },
     password: { type: String, select: false }, // Will not be included in queries by default
     lastAccessed: { type: Date },
+    scanStatus: { 
+        type: String, 
+        enum: ['pending', 'scanning', 'clean', 'infected', null],
+        default: null
+    },
+    scanProgress: { type: Number, default: 0, min: 0, max: 100 },
+    scanResult: {
+        type: String,
+        default: null
+    },
+    scanDate: {
+        type: Date,
+        default: null
+    },
     userAccess: [{
         userId: { type: String, required: true },
         lastAccessed: { type: Date, required: true }
-    }],
-    createdAt: { type: Date, default: Date.now }
-});
+    }]
+}, { timestamps: true });
 
 // Add index for faster queries
 fileSchema.index({ userId: 1, parent_id: 1, deleted: 1 });
